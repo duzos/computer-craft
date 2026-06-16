@@ -73,6 +73,8 @@ local function announce()
 end
 
 ----------------------------------------------------------------- inventory
+local function shortId(id) return id and (id:match("[^:]+$") or id) or "?" end
+
 local function countId(id)
   local n = 0
   for s = 1, 16 do local d = turtle.getItemDetail(s); if d and d.name == id then n = n + d.count end end
@@ -149,6 +151,7 @@ local function runStep(step)
   if not turtle.craft then return false end             -- crafting table not equipped
   local per = math.max(1, math.min(64, math.floor(64 / math.max(1, step.yield))))
   local remaining = step.batches
+  local done = 0
   while remaining > 0 do
     local chunk = math.min(remaining, per)
     if not arrange(step.grid, chunk) then return false end
@@ -157,6 +160,8 @@ local function runStep(step)
     turtle.select(out)
     if not turtle.craft(chunk) then return false end
     remaining = remaining - chunk
+    done = done + chunk
+    if step.batches > per then print(("    %d/%d"):format(done, step.batches)) end   -- chunked progress
   end
   return true
 end
@@ -165,12 +170,15 @@ local function execute(steps)
   dumpAll()                                           -- clean slate
   while turtle.suck() do end                          -- pull all the raws the store pushed to craftIn
   local target = steps[#steps] and steps[#steps].out
+  print(("crafting %s  (%d step%s)"):format(shortId(target), #steps, #steps == 1 and "" or "s"))
   local ok = true
-  for _, step in ipairs(steps) do
-    if not runStep(step) then ok = false; break end
+  for i, step in ipairs(steps) do
+    print(("  [%d/%d] %d x %s"):format(i, #steps, step.batches * step.yield, shortId(step.out)))
+    if not runStep(step) then ok = false; print("  FAILED at " .. shortId(step.out)); break end
   end
   local made = target and countId(target) or 0
   dumpAll()                                           -- finished goods + leftovers -> craftOut -> pool
+  print(ok and ("done: made " .. made .. " x " .. shortId(target)) or "craft failed (see above)")
   return ok, made
 end
 
