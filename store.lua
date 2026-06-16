@@ -99,6 +99,7 @@ local SEED_RECIPES = {
   ["minecraft:torch"]          = { yield = 4, grid = { [1] = "minecraft:charcoal", [5] = "minecraft:stick" } },
   ["minecraft:iron_ingot"]     = { yield = 1, grid = fill9("minecraft:iron_nugget") },
   ["minecraft:gold_ingot"]     = { yield = 1, grid = fill9("minecraft:gold_nugget") },
+  ["minecraft:bone_meal"]      = { yield = 3, grid = { [1] = "minecraft:bone" } },
   ["minecraft:hopper"]         = { yield = 1, grid = { [1]="minecraft:iron_ingot", [3]="minecraft:iron_ingot",
                                                        [5]="minecraft:iron_ingot", [6]="minecraft:chest", [7]="minecraft:iron_ingot",
                                                        [10]="minecraft:iron_ingot" } },
