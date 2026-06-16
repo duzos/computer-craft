@@ -74,6 +74,33 @@ local outputs  = {}
 local fuels    = {}
 local roles    = {}          -- name -> "input"|"output"|"fuel"  (unmarked = pool; IO_BARREL = both)
 local ROLES_FILE = "store.roles"
+local recipes  = {}          -- id -> { yield, grid = {turtleSlot -> ingredientId} }; learned by the crafter
+local RECIPES_FILE = "store.recipes"
+-- prefilled on first boot (no store.recipes file); learned recipes override per id (last-wins).
+-- grids key the 3x3 by turtle slot ( 1 2 3 / 5 6 7 / 9 10 11 ). all wood on this server is spruce.
+-- these are concrete vanilla recipes; verify/relearn any in-game with `crafter learn` if a shape is off.
+local PLANK = "minecraft:spruce_planks"
+local function ring8(id)     -- 8 of `id` around an empty centre (chest/furnace shape)
+  return { [1]=id, [2]=id, [3]=id, [5]=id, [7]=id, [9]=id, [10]=id, [11]=id }
+end
+local function fill9(id) local g = {}; for _, s in ipairs({1,2,3,5,6,7,9,10,11}) do g[s] = id end; return g end
+local SEED_RECIPES = {
+  ["minecraft:spruce_planks"]  = { yield = 4, grid = { [1] = "minecraft:spruce_log" } },
+  ["minecraft:spruce_slab"]    = { yield = 6, grid = { [1] = PLANK, [2] = PLANK, [3] = PLANK } },
+  ["minecraft:stick"]          = { yield = 4, grid = { [1] = PLANK, [5] = PLANK } },
+  ["minecraft:crafting_table"] = { yield = 1, grid = { [1] = PLANK, [2] = PLANK, [5] = PLANK, [6] = PLANK } },
+  ["minecraft:chest"]          = { yield = 1, grid = ring8(PLANK) },
+  ["minecraft:barrel"]         = { yield = 1, grid = { [1]=PLANK, [2]="minecraft:spruce_slab", [3]=PLANK,
+                                                       [5]=PLANK, [7]=PLANK,
+                                                       [9]=PLANK, [10]="minecraft:spruce_slab", [11]=PLANK } },
+  ["minecraft:furnace"]        = { yield = 1, grid = ring8("minecraft:cobblestone") },
+  ["minecraft:torch"]          = { yield = 4, grid = { [1] = "minecraft:charcoal", [5] = "minecraft:stick" } },
+  ["minecraft:iron_ingot"]     = { yield = 1, grid = fill9("minecraft:iron_nugget") },
+  ["minecraft:gold_ingot"]     = { yield = 1, grid = fill9("minecraft:gold_nugget") },
+  ["minecraft:hopper"]         = { yield = 1, grid = { [1]="minecraft:iron_ingot", [3]="minecraft:iron_ingot",
+                                                       [5]="minecraft:iron_ingot", [6]="minecraft:chest", [7]="minecraft:iron_ingot",
+                                                       [10]="minecraft:iron_ingot" } },
+}
 local monitor, chatBox, manager
 local monitors = {}          -- all monitors, biggest first
 local monAssign = {}         -- monitor network-name -> "quarry"|"store"|"blank" (unset = auto by size)
@@ -93,8 +120,14 @@ local function storeState(name)
   return s
 end
 local turtles  = {}          -- id -> telemetry + lastHeard/eta/lastProgress
-local pendingCmd = {}        -- id -> "rtb"|"continue"|"reboot"
+local pendingCmd = {}        -- id -> "rtb"|"continue"|"reboot" | a craftplan table (crafter)
 local cmdQueue = {}
+local crafterId  = nil       -- the crafty turtle's computer id (learned from its telem)
+local crafterIn  = nil       -- its craftIn barrel (push target; excluded from the pool by discover)
+local craftJob   = nil       -- in-flight craft: { id, count, dest, plan }
+local craftQueue = {}        -- pending craft requests (single job in flight): { id, count, force, dest }
+local craftDone  = {}        -- craftdone messages handed from commsLoop to the worker to finish
+local crafterInDirty = false -- set in onTelem when craftIn is learned; the worker re-runs discover()
 local mode = "SORT"          -- SORT (auto-eat barrel) | WAIT (holding a pickup)
 local lastSnap = nil
 local lastAction = "-"
@@ -154,6 +187,19 @@ local function loadAuto()
   end
 end
 
+local function saveRecipes()
+  local f = fs.open(RECIPES_FILE, "w"); f.write(textutils.serialize(recipes)); f.close()
+end
+
+local function loadRecipes()
+  if fs.exists(RECIPES_FILE) then
+    local f = fs.open(RECIPES_FILE, "r"); recipes = textutils.unserialize(f.readAll()) or {}; f.close()
+  else
+    for id, r in pairs(SEED_RECIPES) do recipes[id] = r end   -- prefill the common set on first boot
+    saveRecipes()
+  end
+end
+
 ----------------------------------------------------------------- discovery
 local SIDES = { top = true, bottom = true, left = true, right = true, front = true, back = true }
 local skipped = {}
@@ -163,6 +209,8 @@ local function discover()
   for _, name in ipairs(peripheral.getNames()) do
     if SIDES[name] then
       if peripheral.hasType(name, "inventory") then skipped[#skipped + 1] = name end
+    elseif name == crafterIn then                       -- push-only craft feed: never pooled/vacuumed
+      -- excluded from every list; the store pushes raws here and the crafter sucks them
     elseif peripheral.hasType(name, "inventory")
         and name ~= IO_BARREL and name ~= MANAGER_BARREL and not PROC_SET[name] then
       local r = roles[name]
@@ -491,6 +539,11 @@ end
 local STALE_SECS  = 180
 local STALL_GRACE = 300       -- no %-progress for this long (while mining) => "STALL"; must exceed one layer's mine time
 
+local function craftDonePending(id)   -- a finished job for `id` still queued for the worker to settle
+  for _, m in ipairs(craftDone) do if m.id == id then return true end end
+  return false
+end
+
 local function onTelem(id, t, dist)
   local prev, now = turtles[id], os.clock()
   local eta = prev and prev.eta or nil
@@ -512,6 +565,18 @@ local function onTelem(id, t, dist)
     lastHeard = now, eta = eta, lastProgress = lastProgress,
     alerted = prev and prev.alerted or nil, doneAlerted = prev and prev.doneAlerted or nil,
   }
+  if t.kind == "craft" then
+    crafterId = id
+    if t.craftIn and t.craftIn ~= "" and t.craftIn ~= crafterIn then
+      crafterIn = t.craftIn; crafterInDirty = true  -- worker re-runs discover() to keep craftIn out of the pool
+    end
+    -- re-arm a latched job only if its plan was genuinely lost (dropped reply / crafter reboot).
+    -- NOT while a craftdone for it is still queued: the crafter can report idle in the window
+    -- before the worker settles the job, and re-arming there would re-run an empty craft + double-deliver.
+    if craftJob and t.phase == "idle" and pendingCmd[id] == nil and not craftDonePending(id) then
+      pendingCmd[id] = { type = "craftplan", steps = craftJob.plan.steps }
+    end
+  end
 end
 
 -- a mining turtle is "stuck" if its % hasn't advanced for STALL_GRACE while it should be working
@@ -576,6 +641,174 @@ local function checkAlerts()
   end
 end
 
+----------------------------------------------------------------- crafting
+local CRAFT_DEPTH = 12       -- recursion backstop for recipe trees (doubles as a cycle backstop)
+
+-- match a query against learned recipe ids; needed because resolve() only knows the live
+-- index, so a craftable-but-unstocked item (0 count) is invisible to it
+local function resolveCraftable(q)
+  if not q then return nil end
+  if recipes[q] then return q end
+  local hits, exact = {}, {}
+  for id in pairs(recipes) do
+    if id:find(q, 1, true) then
+      hits[#hits + 1] = id
+      if shortId(id) == q then exact[#exact + 1] = id end
+    end
+  end
+  if #exact == 1 then return exact[1] end
+  if #hits == 1 then return hits[1] end
+  return nil
+end
+
+-- group a recipe grid into ingredient -> slot count (repeated ingredients merged)
+local function gridDemand(grid)
+  local demand = {}
+  for _, ing in pairs(grid) do demand[ing] = (demand[ing] or 0) + 1 end
+  return demand
+end
+
+-- exact resolver: plan how to craft `qty` of `id` from the live pool, preferring stock and
+-- crafting only the gap. returns { ok=true, steps=<leaves first>, pull=<id->count> } or
+-- { ok=false, missing=<id->shortfall> }. works on a stock copy: consumes/delivers nothing.
+-- assumes every ingredient stacks to 64; the executor chunks crafts so output stays <=64 but
+-- does not split a single non-stacking ingredient across slots (buckets etc. unsupported, v1).
+local function planCraft(id, qty, force)
+  local have, pull, missing = {}, {}, {}
+  for iid, e in pairs(index.items) do have[iid] = e.count end
+  if force then have[id] = 0 end                        -- `craft <id> n`: make N new even if some are stocked
+  local steps, stack = {}, {}
+
+  local function need(want, n, depth)
+    local take = math.min(have[want] or 0, n)
+    have[want] = (have[want] or 0) - take
+    if take > 0 then pull[want] = (pull[want] or 0) + take end
+    n = n - take
+    if n <= 0 then return true end
+    local r = recipes[want]
+    if not r or stack[want] or depth > CRAFT_DEPTH then
+      missing[want] = (missing[want] or 0) + n
+      return false
+    end
+    stack[want] = true
+    local batches = math.ceil(n / r.yield)
+    local ok = true
+    for ing, slots in pairs(gridDemand(r.grid)) do
+      if not need(ing, batches * slots, depth + 1) then ok = false end   -- no break: collect all shortfalls
+    end
+    stack[want] = nil
+    if not ok then return false end
+    steps[#steps + 1] = { out = want, yield = r.yield, grid = r.grid, batches = batches }
+    have[want] = (have[want] or 0) + batches * r.yield - n               -- over-craft surplus feeds parents
+    return true
+  end
+
+  if need(id, qty, 0) then return { ok = true, steps = steps, pull = pull } end
+  return { ok = false, missing = missing }
+end
+
+-- advisory "max if dedicated" amount per recipe (AE2/RS convention): how many of each id you
+-- could make pouring all materials into that one item. memoized, recomputed only on index change.
+local craftableCache, craftableRev = nil, -1
+local function computeCraftable()
+  if craftableCache and craftableRev == uiRev then return craftableCache end
+  local memo, stack = {}, {}
+  local function maxMake(id, depth)
+    if memo[id] ~= nil then return memo[id] end
+    local stock = (index.items[id] and index.items[id].count) or 0
+    local r = recipes[id]
+    if not r or stack[id] or depth > CRAFT_DEPTH then return stock end    -- raw / cycle: limited by stock
+    stack[id] = true
+    local best
+    for ing, slots in pairs(gridDemand(r.grid)) do
+      local out = math.floor(maxMake(ing, depth + 1) / slots) * r.yield
+      if not best or out < best then best = out end
+    end
+    stack[id] = nil
+    memo[id] = stock + (best or 0)
+    return memo[id]
+  end
+  local cache = {}
+  for id in pairs(recipes) do cache[id] = maxMake(id, 0) end
+  craftableCache, craftableRev = cache, uiRev
+  return cache
+end
+
+local function craftShort(id, missing)
+  local parts = {}
+  for mid, n in pairs(missing) do parts[#parts + 1] = n .. " " .. shortId(mid) end
+  table.sort(parts)
+  return "can't craft " .. shortId(id) .. " (short: " .. table.concat(parts, ", ") .. ")"
+end
+
+local function crafterReady() return crafterId ~= nil and crafterIn ~= nil and crafterIn ~= "" end
+
+-- plan, deliver the raws to craftIn, latch the job, queue the plan as the crafter's
+-- next telem reply; returns ok, message
+local function beginCraft(req)
+  vacuumInputs(); ensureIndex()                         -- pool any just-deposited materials first
+  local plan = planCraft(req.id, req.count, req.force)
+  if not plan.ok then return false, craftShort(req.id, plan.missing) end
+  for pid, n in pairs(plan.pull) do
+    local e = index.items[pid]
+    if e then pullEntry(pid, e, crafterIn, n) end
+  end
+  craftJob = { id = req.id, count = req.count, dest = req.dest, plan = plan }
+  pendingCmd[crafterId] = { type = "craftplan", steps = plan.steps }
+  return true, "crafting " .. req.count .. " x " .. shortId(req.id)
+end
+
+-- start the next queued job once the current one frees up; logs the outcome
+local function startNextCraft()
+  while #craftQueue > 0 and not craftJob do
+    local ok, msg = beginCraft(table.remove(craftQueue, 1))
+    logAction(msg)
+    if ok then return end
+  end
+end
+
+-- entry point for both the `craft` command and the get/withdraw shortfall hook
+local function requestCraft(id, count, force, dest)
+  if not recipes[id] then return false, "no recipe for " .. shortId(id) end
+  if not crafterReady() then return false, "no crafter online" end
+  if craftJob then
+    craftQueue[#craftQueue + 1] = { id = id, count = count, force = force, dest = dest }
+    return true, "queued " .. count .. " x " .. shortId(id) .. " (crafter busy)"
+  end
+  return beginCraft({ id = id, count = count, force = force, dest = dest })
+end
+
+-- shortfall hook: try to craft the gap; returns a suffix for the get/withdraw reply
+local function craftGap(id, gap, dest)
+  if not recipes[id] then return "" end
+  local _, msg = requestCraft(id, gap, false, dest)
+  return " | " .. msg
+end
+
+-- worker-coroutine handler for craftdone: finished goods have vacuumed back into the pool,
+-- so re-run the latched delivery, then kick the queue
+local function finishCraft(msg)
+  local job = craftJob; craftJob = nil   -- clear BEFORE ensureIndex(): buildIndex yields, and a stray idle
+  vacuumInputs(); ensureIndex()          -- telem during that yield must not see a latched job and re-arm it
+  if job then
+    if not msg.ok then
+      logAction("craft failed: " .. shortId(job.id) .. " (turtle inventory overflow?)")
+    else
+      local n = msg.made or job.count
+      if job.dest == "player" then
+        logAction(("crafted %d x %s, gave you %d"):format(n, shortId(job.id), deliverToPlayer(job.id, job.count)))
+      elseif job.dest == "output" then
+        local d, usedIO = retrieve(job.id, job.count)
+        if usedIO then mode = "WAIT" end
+        logAction(("crafted %d x %s, dispensed %d"):format(n, shortId(job.id), d))
+      else
+        logAction(("crafted %d x %s -> pool"):format(n, shortId(job.id)))
+      end
+    end
+  end
+  startNextCraft()
+end
+
 local function handle(line, reply, origin)
   ensureIndex()                                     -- one rebuild only if the pool changed since last
   local args = {}
@@ -591,22 +824,37 @@ local function handle(line, reply, origin)
     end
     reply(msg)
   elseif cmd == "get" then
-    local id, err = resolve(args[2] and args[2]:lower() or nil)
+    local q = args[2] and args[2]:lower() or nil
+    local id, err = resolve(q)
+    if not id then id = resolveCraftable(q) end         -- 0-stock but craftable
     if not id then reply(err) else
       local n = tonumber(args[3]) or 64
       if origin == "chat" and manager then
-        reply("delivered " .. deliverToPlayer(id, n) .. " x " .. id .. " to your inventory")
+        local got = deliverToPlayer(id, n)
+        local msg = "delivered " .. got .. " x " .. id .. " to your inventory"
+        if got < n then msg = msg .. craftGap(id, n - got, "player") end
+        reply(msg)
       else
         local got, usedIO = retrieve(id, n)
         if usedIO then mode = "WAIT" end
-        reply("dispensed " .. got .. " x " .. id)
+        local msg = "dispensed " .. got .. " x " .. id
+        if got < n then msg = msg .. craftGap(id, n - got, "output") end
+        reply(msg)
       end
     end
   elseif cmd == "withdraw" then
-    local id, err = resolve(args[2] and args[2]:lower() or nil)
+    local q = args[2] and args[2]:lower() or nil
+    local id, err = resolve(q)
+    if not id then id = resolveCraftable(q) end
     if not id then reply(err)
     elseif not manager then reply("no inventory manager found")
-    else reply("withdrew " .. deliverToPlayer(id, tonumber(args[3]) or 64) .. " x " .. id .. " to you") end
+    else
+      local n = tonumber(args[3]) or 64
+      local got = deliverToPlayer(id, n)
+      local msg = "withdrew " .. got .. " x " .. id .. " to you"
+      if got < n then msg = msg .. craftGap(id, n - got, "player") end
+      reply(msg)
+    end
   elseif cmd == "deposit" then
     if not manager then reply("no inventory manager found")
     elseif not args[2] or args[2]:lower() == "all" then
@@ -690,13 +938,14 @@ local function handle(line, reply, origin)
   elseif cmd == "marks" then
     local parts = { IO_BARREL .. "=both" }
     for n, r in pairs(SPECIAL_ROLE) do parts[#parts + 1] = n .. "=" .. r end
+    if crafterIn then parts[#parts + 1] = crafterIn .. "=craftIn" end
     for n, r in pairs(roles) do parts[#parts + 1] = n .. "=" .. r end
     reply(table.concat(parts, "  "))
   elseif cmd == "invs" then
     local parts = {}
     for _, n in ipairs(peripheral.getNames()) do
       if not SIDES[n] and peripheral.hasType(n, "inventory") then
-        local r = (n == IO_BARREL) and "both" or SPECIAL_ROLE[n] or roles[n] or "storage"
+        local r = (n == IO_BARREL) and "both" or SPECIAL_ROLE[n] or (n == crafterIn and "craftIn") or roles[n] or "storage"
         parts[#parts + 1] = n .. "(" .. r .. ")"
       end
     end
@@ -725,10 +974,14 @@ local function handle(line, reply, origin)
     reply(textutils.serialize(gatherStats()))
   elseif cmd == "items" then
     ensureIndex()
+    local craftable = computeCraftable()
     local arr = {}
     for id, e in pairs(index.items) do arr[#arr + 1] = { id = id, n = e.count } end
     table.sort(arr, function(a, b) return a.n > b.n end)
-    for i = #arr, 201, -1 do arr[i] = nil end      -- cap payload at 200 types
+    for i = #arr, 201, -1 do arr[i] = nil end      -- cap stocked rows at 200 types
+    for id, m in pairs(craftable) do               -- craft-only rows (0 stock, craftable now)
+      if m > 0 and not index.items[id] then arr[#arr + 1] = { id = id, n = 0, craft = m } end
+    end
     reply(textutils.serialize({
       mode = mode, usedSlots = index.usedSlots, totalSlots = index.totalSlots,
       totalItems = index.totalItems, types = index.types, list = arr,
@@ -806,8 +1059,35 @@ local function handle(line, reply, origin)
     else
       reply("usage: reboot [store|fleet|stations|all]")
     end
+  elseif cmd == "craft" then
+    local q = args[2] and args[2]:lower() or nil
+    local id = resolve(q) or resolveCraftable(q)
+    if not id then reply("no item/recipe matches '" .. tostring(q) .. "'")
+    elseif not recipes[id] then reply("no recipe for " .. shortId(id) .. " (teach it: crafter learn)")
+    else
+      local _, msg = requestCraft(id, tonumber(args[3]) or 1, true, "pool")   -- craft N new into the pool
+      reply(msg)
+    end
+  elseif cmd == "recipes" then
+    local parts = {}
+    for id, r in pairs(recipes) do parts[#parts + 1] = shortId(id) .. " x" .. r.yield end
+    table.sort(parts)
+    reply(#parts > 0 and (#parts .. " recipes: " .. table.concat(parts, ", ")) or "no recipes learned")
+  elseif cmd == "recipe" then
+    local q = args[2] and args[2]:lower() or nil
+    local id = (q and recipes[q]) and q or resolveCraftable(q)
+    if not id or not recipes[id] then reply("no recipe for '" .. tostring(q) .. "'")
+    elseif (args[3] or ""):lower() == "forget" or (args[3] or ""):lower() == "delete" then
+      recipes[id] = nil; saveRecipes(); uiDirty(); reply("forgot recipe " .. shortId(id))
+    else
+      local r = recipes[id]
+      local cells = {}
+      for slot, ing in pairs(r.grid) do cells[#cells + 1] = slot .. ":" .. shortId(ing) end
+      table.sort(cells)
+      reply(shortId(id) .. " x" .. r.yield .. " <= " .. table.concat(cells, " "))
+    end
   elseif cmd == "help" then
-    reply("sort | get <id> [n] | withdraw <id> [n] | deposit [id|all] [n] | process <smelt|cook|wash> <id> [n] | smelt <id> [n] | rtb [id|all] | continue [id|all] | auto <type> add|remove <id> | fuel <name> [n] | find <text> | list | mark <name> <input|output|storage|fuel> | marks | invs | reboot [store|fleet|stations|all]")
+    reply("sort | get <id> [n] | withdraw <id> [n] | deposit [id|all] [n] | process <smelt|cook|wash> <id> [n] | smelt <id> [n] | craft <id> [n] | recipes | recipe <id> [forget] | rtb [id|all] | continue [id|all] | auto <type> add|remove <id> | fuel <name> [n] | find <text> | list | mark <name> <input|output|storage|fuel> | marks | invs | reboot [store|fleet|stations|all]")
   else
     reply("unknown command: " .. cmd)
   end
@@ -1062,11 +1342,12 @@ local function drawQuarry(mon)
     else statusCol, statusTxt = (ago < 15 and colors.lime or colors.lightGray), fmtAgo(ago) end
 
     local tree = tr.kind == "tree"
+    local noPct = tree or tr.kind == "craft"         -- trees + crafters have no mining %
     local nm = tr.label or ("t" .. tr.id)
     txt(1, row, nm, colors.white, rbg)
     txt(w - #statusTxt + 1, row, statusTxt, statusCol, rbg)
     local bx = #nm + 2
-    if not tree then                                 -- mining progress %; trees have none
+    if not noPct then                                -- mining progress %; trees/crafters have none
       local pctTxt = (tr.pct or 0) .. "%"
       txt(bx, row, pctTxt, colors.yellow, rbg)
       bx = bx + #pctTxt + 1
@@ -1076,7 +1357,7 @@ local function drawQuarry(mon)
       txt(bx, row, dTxt, rangeColour(rangeState(tr.dist)), rbg)
       bx = bx + #dTxt + 1
     end
-    if not tree and w - bx - #statusTxt - 1 > 4 then
+    if not noPct and w - bx - #statusTxt - 1 > 4 then
       bar(bx, row, w - bx - #statusTxt - 1, (tr.pct or 0) / 100, colors.green)
     end
     row = row + 1
@@ -1089,7 +1370,7 @@ local function drawQuarry(mon)
       if tree then                                   -- last harvest stats instead of fuel/eta
         local cut = tr.lastMine and fmtAgo(now - tr.lastMine) or "-"
         txt(dx, row, ("logs %d   cut %s"):format(tr.logs or 0, cut), colors.lightGray, rbg)
-      else
+      elseif tr.kind ~= "craft" then                 -- crafters show only their phase (above)
         local last = tr.last and (tr.last:match("[^:]+$") or tr.last) or "-"
         local ffrac = (tr.fuelMax and tr.fuelMax > 0) and (tr.fuel or 0) / tr.fuelMax or 0
         local fcol = ffrac > 0.5 and colors.lime or (ffrac > 0.2 and colors.orange or colors.red)
@@ -1128,8 +1409,12 @@ local function drawStore(mon)
   end
   local function short(id) return id:match("[^:]+$") or id end
 
+  local craftable = computeCraftable()
   local arr = {}
   for id, e in pairs(index.items) do arr[#arr + 1] = { id = id, n = e.count } end
+  for id, m in pairs(craftable) do                       -- craft-only rows: 0 stock, craftable now
+    if m > 0 and not index.items[id] then arr[#arr + 1] = { id = id, n = m, craft = true } end
+  end
   table.sort(arr, STORE_SORTS[st.sortMode].cmp)
   if not st.selId and arr[1] then st.selId = arr[1].id end
 
@@ -1157,16 +1442,22 @@ local function drawStore(mon)
     if it then
       local on = (it.id == st.selId)
       if on then fillRow(y, colors.gray) end
-      local cnt = tostring(it.n)
+      local cnt = it.craft and ("+" .. it.n) or tostring(it.n)   -- "+N" cyan = craftable, not stocked
       txt(1, y, short(it.id), on and colors.white or colors.lightGray, on and colors.gray or nil)
-      txt(w - #cnt + 1, y, cnt, colors.yellow, on and colors.gray or nil)
+      txt(w - #cnt + 1, y, cnt, it.craft and colors.cyan or colors.yellow, on and colors.gray or nil)
       reg.items[y] = it.id
     end
   end
   txt(1, listBottom + 1, string.rep("-", w), colors.gray)
 
   local selE = st.selId and index.items[st.selId]
-  txt(1, h - 3, selE and ("> " .. short(st.selId) .. " (" .. selE.count .. ")") or "> -", colors.white)
+  if selE then
+    txt(1, h - 3, "> " .. short(st.selId) .. " (" .. selE.count .. ")", colors.white)
+  elseif st.selId and (craftable[st.selId] or 0) > 0 then
+    txt(1, h - 3, "> " .. short(st.selId) .. " (craft " .. craftable[st.selId] .. ")", colors.cyan)
+  else
+    txt(1, h - 3, "> -", colors.white)
+  end
 
   txt(1, h - 2, "amt", colors.cyan)
   local ax = 5
@@ -1322,6 +1613,8 @@ local function workerLoop()
       local c = table.remove(cmdQueue, 1)
       handle(c.line, c.reply, c.origin)
     end
+    while #craftDone > 0 do finishCraft(table.remove(craftDone, 1)) end
+    if crafterInDirty then crafterInDirty = false; discover() end   -- learned craftIn: drop it from the pool
     local now = os.clock()
     if now - lastVac   > 1  then vacuumInputs();   lastVac   = now end   -- inputs/OUT_BARREL -> pool
     if now - lastSort  > 1  then autoSortCheck();  lastSort  = now end
@@ -1360,6 +1653,15 @@ local function commsLoop()
         alertPlayer((msg.label or ("turtle " .. m.from)) .. ": " .. tostring(msg.msg))
         local tr = turtles[m.from]
         if tr then tr.err = msg.msg; tr.lastHeard = os.clock() end
+        comms.send(m.from, "ok", STORE_PROTOCOL)
+      elseif type(msg) == "table" and msg.type == "recipe" then
+        if msg.out then
+          recipes[msg.out] = { yield = msg.yield or 1, grid = msg.grid or {} }
+          saveRecipes(); uiDirty(); logAction("learned recipe " .. shortId(msg.out))
+        end
+        comms.send(m.from, "ok", STORE_PROTOCOL)
+      elseif type(msg) == "table" and msg.type == "craftdone" then
+        craftDone[#craftDone + 1] = msg              -- the worker finishes it (it touches the index)
         comms.send(m.from, "ok", STORE_PROTOCOL)
       elseif type(msg) == "string" then
         local from = m.from
@@ -1438,6 +1740,7 @@ local function main()
   loadRoles()
   loadAuto()
   loadMons()
+  loadRecipes()
   discover()
   if SIDES[IO_BARREL] then
     print("IO_BARREL is '" .. IO_BARREL .. "', a block touching the computer.")

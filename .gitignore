@@ -3,6 +3,7 @@
 *.cfg
 *.auto
 *.roles
+*.recipes
 *.etag
 *.token
 

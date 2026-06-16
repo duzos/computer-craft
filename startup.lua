@@ -10,6 +10,7 @@
 --   quarry  quarry2.lua
 --   tree    treefarm.lua
 --   wheat   wheatfarm.lua
+--   crafter crafter.lua
 --   boiler  boilerkeeper.lua
 --   pad     storepad.lua
 --
@@ -29,6 +30,7 @@ local ROLES = {
   quarry = { run = "quarry2.lua" },
   tree   = { run = "treefarm.lua" },
   wheat  = { run = "wheatfarm.lua" },
+  crafter = { run = "crafter.lua" },
   boiler = { run = "boilerkeeper.lua" },
   pad    = { run = "storepad.lua" },
 }

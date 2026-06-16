@@ -107,15 +107,20 @@ local function storeRender()
     if it then
       local on = (idx == sel)
       if on then fillRow(y, colors.gray) end
-      local cnt = tostring(it.n)
+      local craftOnly = (it.n or 0) == 0 and (it.craft or 0) > 0
+      local cnt = craftOnly and ("+" .. it.craft) or tostring(it.n)   -- "+N" cyan = craftable, not stocked
       at(1, y, clip(short(it.id), W - #cnt - 1), on and colors.white or colors.lightGray, on and colors.gray or nil)
-      at(W - #cnt + 1, y, cnt, colors.yellow, on and colors.gray or nil)
+      at(W - #cnt + 1, y, cnt, craftOnly and colors.cyan or colors.yellow, on and colors.gray or nil)
     end
   end
   at(1, LIST_BOTTOM + 1, string.rep("-", W), colors.gray)
 
   local cur = items[sel]
-  at(1, H - 3, cur and ("> " .. clip(short(cur.id), W - 8) .. " (" .. cur.n .. ")") or "> -", colors.white)
+  if cur and (cur.n or 0) == 0 and (cur.craft or 0) > 0 then
+    at(1, H - 3, "> " .. clip(short(cur.id), W - 12) .. " (craft " .. cur.craft .. ")", colors.cyan)
+  else
+    at(1, H - 3, cur and ("> " .. clip(short(cur.id), W - 8) .. " (" .. cur.n .. ")") or "> -", colors.white)
+  end
   amtRegions = {}
   at(1, H - 2, "amt", colors.cyan)
   local x = 5
@@ -181,7 +186,10 @@ local function storeClick(x, y)
     local idx = scroll + (y - LIST_TOP) + 1
     if items[idx] then
       local now = os.clock()
-      if idx == lastIdx and (now - lastClick) < 0.5 then sel = idx; doGet(items[idx].n); lastIdx = nil
+      if idx == lastIdx and (now - lastClick) < 0.5 then
+        sel = idx
+        if (items[idx].n or 0) == 0 then doGet() else doGet(items[idx].n) end   -- craft-only: get `amt`
+        lastIdx = nil
       else sel = idx; lastIdx, lastClick = idx, now end
     end
   elseif y == H - 2 then
@@ -216,7 +224,7 @@ local function storeChar(c)
   end
   if c == "s" then status = ""; doSortInv()
   elseif c == "m" then status = ""; procPick = true
-  elseif c == "a" then status = ""; if items[sel] then doGet(items[sel].n) end
+  elseif c == "a" then status = ""; if items[sel] then if (items[sel].n or 0) == 0 then doGet() else doGet(items[sel].n) end end
   elseif c == "r" then status = ""; fetchStore()
   elseif c:match("^[1-5]$") then amt = AMOUNTS[tonumber(c)] or amt end
 end
@@ -273,6 +281,8 @@ local function overviewRender()
   if cur then
     if cur.kind == "tree" then
       at(1, H - 4, clip(("%s  logs %d"):format(cur.phase or "?", cur.logs or 0), W - 7), colors.lightGray)
+    elseif cur.kind == "craft" then
+      at(1, H - 4, clip(("%s  crafter"):format(cur.phase or "idle"), W - 7), colors.lightGray)
     else
       at(1, H - 4, clip(("%s eta %s y%d"):format(cur.phase or "?", fmtEta(cur.eta), cur.pos and cur.pos.y or 0), W - 7), colors.lightGray)
     end
@@ -283,6 +293,8 @@ local function overviewRender()
     end
     if cur.kind == "tree" then
       at(1, H - 3, clip(("cut %s  seen %s"):format(cur.mineAgo and fmtAgo(cur.mineAgo) or "-", fmtAgo(cur.ago or 0)), W), colors.lightGray)
+    elseif cur.kind == "craft" then
+      at(1, H - 3, clip(("seen %s"):format(fmtAgo(cur.ago or 0)), W), colors.lightGray)
     else
       at(1, H - 3, clip(("last %s  seen %s"):format(cur.last and short(cur.last) or "-", fmtAgo(cur.ago or 0)), W), colors.lightGray)
     end
