@@ -1,5 +1,5 @@
 -- comms.lua  shared transport for the store / quarry / pad fleet.
--- One envelope over either rednet (wireless modem) or the ClassicPeripherals
+-- One envelope over either rednet (wireless OR wired modem) or the ClassicPeripherals
 -- radio (tower on the store, mini antenna on turtles/pocket). A dual node sends
 -- on both; receivers dedupe by envelope id so a doubled delivery is harmless.
 --
@@ -20,7 +20,8 @@ local FREQ  = 1000
 local PROTO = "store"
 local me    = os.getComputerID()
 
-local radioName, modemSide
+local radioName
+local modemNames = {}   -- every modem opened for rednet (wireless AND wired)
 local names = {}
 local seen  = {}
 local SEEN_TTL = 30
@@ -44,11 +45,18 @@ local function findRadio()
   return nil
 end
 
-local function findModem()
+-- open EVERY modem: wireless for over-air links, wired for the store/boiler cable
+-- network (the store has no wireless modem - it uses the radio tower - so the only
+-- way to reach the rednet-only boiler is over the wired modem they share). rednet.broadcast
+-- then goes out on all open modems and the envelope dedupe drops any doubled delivery.
+local function openModems()
+  modemNames = {}
   for _, n in ipairs(peripheral.getNames()) do
-    if peripheral.getType(n) == "modem" and peripheral.call(n, "isWireless") then return n end
+    if peripheral.getType(n) == "modem" then
+      if not rednet.isOpen(n) then rednet.open(n) end
+      modemNames[#modemNames + 1] = n
+    end
   end
-  return nil
 end
 
 local function newId()
@@ -70,19 +78,18 @@ function comms.open(opts)
   if radioName and hasMethod(radioName, "setFrequency") then
     pcall(peripheral.call, radioName, "setFrequency", FREQ)
   end
-  modemSide = findModem()
-  if modemSide and not rednet.isOpen(modemSide) then rednet.open(modemSide) end
-  return { radio = radioName ~= nil, rednet = modemSide ~= nil, name = radioName }
+  openModems()
+  return { radio = radioName ~= nil, rednet = #modemNames > 0, name = radioName }
 end
 
 function comms.listenAs(name) names[name] = true end
 
-function comms.up() return radioName ~= nil or modemSide ~= nil end
+function comms.up() return radioName ~= nil or #modemNames > 0 end
 
 function comms.transports()
   local t = {}
   if radioName then t[#t + 1] = "radio" end
-  if modemSide then t[#t + 1] = "rednet" end
+  if #modemNames > 0 then t[#t + 1] = "rednet" end
   return t
 end
 
@@ -92,7 +99,7 @@ function comms.send(to, body, proto)
   if radioName then
     pcall(peripheral.call, radioName, "broadcast", textutils.serialise(env))
   end
-  if modemSide then
+  if #modemNames > 0 then
     rednet.broadcast(env, proto)
   end
 end
