@@ -919,16 +919,17 @@ local function handle(line, reply, origin)
     if not id then id = resolveCraftable(q) end         -- 0-stock but craftable
     if not id then reply(err) else
       local n = tonumber(args[3]) or 64
+      local explicit = args[3] ~= nil                   -- auto-craft the full gap only if a count was given; else just 1
       if origin == "chat" and manager then
         local got = deliverToPlayer(id, n)
         local msg = "delivered " .. got .. " x " .. id .. " to your inventory"
-        if got < n then msg = msg .. craftGap(id, n - got, "player") end
+        if got < n then msg = msg .. craftGap(id, explicit and (n - got) or 1, "player") end
         reply(msg)
       else
         local got, usedIO = retrieve(id, n)
         if usedIO then mode = "WAIT" end
         local msg = "dispensed " .. got .. " x " .. id
-        if got < n then msg = msg .. craftGap(id, n - got, "output") end
+        if got < n then msg = msg .. craftGap(id, explicit and (n - got) or 1, "output") end
         reply(msg)
       end
     end
@@ -942,7 +943,7 @@ local function handle(line, reply, origin)
       local n = tonumber(args[3]) or 64
       local got = deliverToPlayer(id, n)
       local msg = "withdrew " .. got .. " x " .. id .. " to you"
-      if got < n then msg = msg .. craftGap(id, n - got, "player") end
+      if got < n then msg = msg .. craftGap(id, args[3] and (n - got) or 1, "player") end   -- craft gap if count given, else 1
       reply(msg)
     end
   elseif cmd == "deposit" then
