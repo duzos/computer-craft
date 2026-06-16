@@ -859,7 +859,7 @@ local function finishCraft(msg)
   vacuumInputs(); ensureIndex()          -- telem during that yield must not see a latched job and re-arm it
   if job then
     if not msg.ok then
-      logAction("craft failed: " .. shortId(job.id) .. " (turtle inventory overflow?)")
+      logAction("craft failed: " .. shortId(job.id) .. (msg.err and (" - " .. msg.err) or ""))
     else
       local n = msg.made or job.count
       if job.dest == "player" then

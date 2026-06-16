@@ -127,11 +127,11 @@ local function gather(id, dst, want)
   return have
 end
 
--- arrange `chunk` of each ingredient into its grid slot for one recipe step
+-- arrange `chunk` of each ingredient into its grid slot for one recipe step; returns ok, reason
 local function arrange(grid, chunk)
-  if not clearGrid() then return false end
+  if not clearGrid() then return false, "inv full" end
   for slot, id in pairs(grid) do
-    if gather(id, slot, chunk) < chunk then return false end
+    if gather(id, slot, chunk) < chunk then return false, "need " .. shortId(id) end
   end
   return true
 end
@@ -147,18 +147,21 @@ end
 ----------------------------------------------------------------- craft
 -- one recipe step: craft `step.batches` times, chunked so neither a grid slot (<=64) nor the
 -- output stack (<=64) overflows. intermediates stay in the inventory for later steps.
+-- run one recipe step; returns ok, reason. reason is short on failure: "bad recipe (relearn)"
+-- (grid didn't match a recipe), "need <item>" (ingredient short), "inv full", "no crafting table".
 local function runStep(step)
-  if not turtle.craft then return false end             -- crafting table not equipped
+  if not turtle.craft then return false, "no crafting table" end
   local per = math.max(1, math.min(64, math.floor(64 / math.max(1, step.yield))))
   local remaining = step.batches
   local done = 0
   while remaining > 0 do
     local chunk = math.min(remaining, per)
-    if not arrange(step.grid, chunk) then return false end
+    local ok, why = arrange(step.grid, chunk)
+    if not ok then return false, why end
     local out = freeOutSlot(step.out)
-    if not out then return false end
+    if not out then return false, "inv full" end
     turtle.select(out)
-    if not turtle.craft(chunk) then return false end
+    if not turtle.craft(chunk) then return false, "bad recipe (relearn)" end
     remaining = remaining - chunk
     done = done + chunk
     if step.batches > per then print(("    %d/%d"):format(done, step.batches)) end   -- chunked progress
@@ -171,15 +174,16 @@ local function execute(steps)
   while turtle.suck() do end                          -- pull all the raws the store pushed to craftIn
   local target = steps[#steps] and steps[#steps].out
   print(("crafting %s  (%d step%s)"):format(shortId(target), #steps, #steps == 1 and "" or "s"))
-  local ok = true
+  local err
   for i, step in ipairs(steps) do
     print(("  [%d/%d] %d x %s"):format(i, #steps, step.batches * step.yield, shortId(step.out)))
-    if not runStep(step) then ok = false; print("  FAILED at " .. shortId(step.out)); break end
+    local ok, why = runStep(step)
+    if not ok then err = shortId(step.out) .. ": " .. (why or "failed"); break end
   end
   local made = target and countId(target) or 0
   dumpAll()                                           -- finished goods + leftovers -> craftOut -> pool
-  print(ok and ("done: made " .. made .. " x " .. shortId(target)) or "craft failed (see above)")
-  return ok, made
+  if err then print("FAILED " .. err) else print("done: made " .. made .. " x " .. shortId(target)) end
+  return not err, made, err
 end
 
 ----------------------------------------------------------------- learn
@@ -246,8 +250,8 @@ local function main()
     local cmd = checkin("idle")
     if type(cmd) == "table" and cmd.type == "craftplan" then
       checkin("crafting")
-      local ok, made = execute(cmd.steps or {})
-      comms.send(STORE_NAME, { type = "craftdone", id = os.getComputerID(), ok = ok, made = made }, STORE_PROTOCOL)
+      local ok, made, err = execute(cmd.steps or {})
+      comms.send(STORE_NAME, { type = "craftdone", id = os.getComputerID(), ok = ok, made = made, err = err }, STORE_PROTOCOL)
       comms.receive(STORE_PROTOCOL, 2)                -- wait for the store's ack
     else
       sleep(2)
