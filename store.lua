@@ -1450,9 +1450,7 @@ local function main()
     return
   end
   if #skipped > 0 then
-    print("WARNING: ignoring inventories attached directly to the computer")
-    print("(they can't transfer over the network - give each a wired modem):")
-    for _, n in ipairs(skipped) do print("  " .. n) end
+    print(("WARNING: %d inventory(s) touching the computer ignored (need a wired modem; use 'invs')"):format(#skipped))
   end
   mode = (snapshot() == "") and "SORT" or "WAIT"   -- workerLoop builds the index on entry
   local link = openLinks()
