@@ -18,13 +18,21 @@ local UA     = "cc-fleet-updater"            -- the github api rejects requests 
 local API = "https://api.github.com/repos/" .. REPO
 local RAW = "https://raw.githubusercontent.com/" .. REPO
 
-local function httpGet(url)
+-- returns body, http status code, response headers; accepts extra request headers
+-- (e.g. If-None-Match for a conditional GET). a non-2xx still yields its response
+-- handle in CC, so we read the code/headers off that too (304/403 carry no body).
+local function httpGet(url, extra)
   if not http then return nil end
-  local h = http.get(url, { ["User-Agent"] = UA })
-  if not h then return nil end
-  local body = h.readAll()
-  h.close()
-  return body
+  local headers = { ["User-Agent"] = UA }
+  if extra then for k, v in pairs(extra) do headers[k] = v end end
+  local h, _, errH = http.get(url, headers)
+  local resp = h or errH
+  if not resp then return nil end
+  local code = (resp.getResponseCode and resp.getResponseCode()) or 200
+  local hdrs = (resp.getResponseHeaders and resp.getResponseHeaders()) or {}
+  local body = resp.readAll()
+  resp.close()
+  return body, code, hdrs
 end
 
 local function getJson(url)
@@ -35,10 +43,17 @@ local function getJson(url)
   return nil
 end
 
-local function headSha()
-  local t = getJson(API .. "/commits/" .. BRANCH)
-  if t and type(t.sha) == "string" then return t.sha end
+local ETAG_FILE = "update.etag"   -- cached {etag, sha} of the last resolved HEAD (gitignored)
+
+local function loadEtag()
+  if not fs.exists(ETAG_FILE) then return nil end
+  local f = fs.open(ETAG_FILE, "r"); local t = textutils.unserialize(f.readAll()); f.close()
+  if type(t) == "table" and type(t.etag) == "string" and type(t.sha) == "string" then return t end
   return nil
+end
+
+local function saveEtag(etag, sha)
+  local f = fs.open(ETAG_FILE, "w"); f.write(textutils.serialize({ etag = etag, sha = sha })); f.close()
 end
 
 local function listLua(sha)
@@ -75,8 +90,29 @@ end
 
 local function run()
   if not http then print("update: http disabled; running current code"); return end
-  local sha = headSha()
-  if not sha then print("update: github unreachable; running current code"); return end
+
+  -- resolve HEAD with a conditional GET: an unchanged HEAD answers 304, which is FREE
+  -- (does not count against the 60/hr unauthenticated API limit) and lets us skip the
+  -- tree + raw fetches entirely. only a moved HEAD (200) costs a real request.
+  local cached = loadEtag()
+  local body, code, hdrs = httpGet(API .. "/commits/" .. BRANCH,
+    cached and { ["If-None-Match"] = cached.etag } or nil)
+  if code == 304 and cached then
+    print("update: up to date (" .. cached.sha:sub(1, 7) .. ")"); return
+  end
+  if code == 403 or code == 429 then
+    print("update: github rate-limited; running current code"); return
+  end
+  if not body or code ~= 200 then
+    print("update: github unreachable; running current code"); return
+  end
+  local ok, commit = pcall(textutils.unserialiseJSON, body)
+  if not (ok and type(commit) == "table" and type(commit.sha) == "string") then
+    print("update: github unreachable; running current code"); return
+  end
+  local sha  = commit.sha
+  local etag = hdrs["ETag"] or hdrs["etag"]
+
   local files = listLua(sha)
   if not files or #files == 0 then print("update: no file list; running current code"); return end
 
@@ -87,15 +123,13 @@ local function run()
     if not parses(data) then
       print("update: bad/incomplete " .. path .. "; aborting, running current code")
       for _, p in ipairs(staged) do fs.delete(p .. ".new") end
-      return
+      return                                 -- abort without caching the etag, so next boot retries
     end
-    if data ~= readAll(path) then        -- only stage files that actually changed
+    if data ~= readAll(path) then            -- only stage files that actually changed
       writeAll(path .. ".new", data)
       staged[#staged + 1] = path
     end
   end
-
-  if #staged == 0 then print("update: up to date (" .. sha:sub(1, 7) .. ")"); return end
 
   -- commit: back up the old file, move the verified copy into place
   for _, path in ipairs(staged) do
@@ -103,7 +137,10 @@ local function run()
     if fs.exists(path) then fs.move(path, path .. ".bak") end
     fs.move(path .. ".new", path)
   end
-  print(("update: %d file(s) -> %s"):format(#staged, sha:sub(1, 7)))
+
+  if etag then saveEtag(etag, sha) end       -- record HEAD so the next unchanged boot is a free 304
+  if #staged == 0 then print("update: up to date (" .. sha:sub(1, 7) .. ")")
+  else print(("update: %d file(s) -> %s"):format(#staged, sha:sub(1, 7))) end
 end
 
 run()

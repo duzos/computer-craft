@@ -3,6 +3,7 @@
 *.cfg
 *.auto
 *.roles
+*.etag
 
 # internal docs + server fingerprint - kept private
 CLAUDE.md
