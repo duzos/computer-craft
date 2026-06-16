@@ -1,0 +1,2 @@
+# keep LF line endings so github raw serves clean files to the in-game updater + parser
+*.lua text eol=lf
