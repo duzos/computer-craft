@@ -1445,11 +1445,8 @@ local function main()
     return
   end
   if not peripheral.isPresent(IO_BARREL) then
-    print("I/O barrel '" .. IO_BARREL .. "' not found. Inventories on the network:")
-    for _, n in ipairs(peripheral.getNames()) do
-      if peripheral.hasType(n, "inventory") and not SIDES[n] then print("  " .. n) end
-    end
-    print("Run 'store reset' to re-enter the barrel names.")
+    print("I/O barrel '" .. IO_BARREL .. "' not found on the network.")
+    print("Run 'store reset' to re-enter the names (? at the prompt lists invs).")
     return
   end
   if #skipped > 0 then
