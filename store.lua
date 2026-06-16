@@ -686,6 +686,11 @@ local function gridDemand(grid)
   return demand
 end
 
+-- per-step copy of a recipe grid: a plan that crafts the same recipe twice (e.g. planks for a
+-- barrel) would otherwise put the SAME grid table in two steps, and textutils.serialise refuses to
+-- send a body with a repeated table reference ("cannot serialize table with repeated entries").
+local function gridCopy(g) local c = {}; for k, v in pairs(g) do c[k] = v end; return c end
+
 -- exact resolver: plan how to craft `qty` of `id` from the live pool, preferring stock and
 -- crafting only the gap. returns { ok=true, steps=<leaves first>, pull=<id->count> } or
 -- { ok=false, missing=<id->shortfall> }. works on a stock copy: consumes/delivers nothing.
@@ -714,7 +719,7 @@ local function planCraft(id, qty, force)
       end
       stack[want] = nil
       if not ok then return false end
-      steps[#steps + 1] = { out = want, yield = r.yield, grid = r.grid, batches = batches }
+      steps[#steps + 1] = { out = want, yield = r.yield, grid = gridCopy(r.grid), batches = batches }
       have[want] = (have[want] or 0) + batches * r.yield - n             -- over-craft surplus feeds parents
       return true
     end
