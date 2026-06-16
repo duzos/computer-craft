@@ -30,13 +30,14 @@ local CFG_FILE       = "crafter.cfg"
 local CRAFT_IN  = ""               -- chest in front; store pushes raws here (kept out of the pool)
 local CRAFT_OUT = ""               -- chest below; finished goods land here (marked input)
 
-local GRID = { 1, 2, 3, 5, 6, 7, 9, 10, 11 }    -- turtle slots that form the 3x3 crafting grid
-local FREE = { 4, 8, 12, 13, 14, 15, 16 }       -- non-grid slots: scratch + crafted output
+-- turtle.craft reads the 3x3 crafting region = the TOP-LEFT of the 4-wide inventory, which spans the
+-- whole top 3 rows (slots 1-12). a stray item anywhere in slots 1-12 (incl. the column-4 slots 4/8/12)
+-- breaks the recipe match - a shapeless recipe counts every item in that region. so only the bottom row
+-- (13-16) is safe for leftovers + output, and the whole region 1-12 is cleared before each craft.
+local GRID  = { 1, 2, 3, 5, 6, 7, 9, 10, 11 }   -- the 3x3 recipe cells
+local STASH = { 13, 14, 15, 16 }                 -- bottom row: outside the region, holds leftovers + output
 
 local args = { ... }
-
-local gridSet = {}
-for _, s in ipairs(GRID) do gridSet[s] = true end
 
 ----------------------------------------------------------------- comms
 -- a queued "reboot" from the store is honored wherever we read a reply, so `reboot fleet`
@@ -88,56 +89,53 @@ local function dumpAll()                              -- everything -> craftOut 
   turtle.select(1)
 end
 
--- move grid slot `s` into the non-grid scratch slots so it can be re-arranged for a step
-local function clearGridSlot(s)
-  turtle.select(s)
-  for _, f in ipairs(FREE) do
-    if turtle.getItemCount(s) == 0 then break end
-    turtle.transferTo(f)
-  end
-  return turtle.getItemCount(s) == 0
-end
-
-local function clearGrid()
+-- empty the whole crafting region (slots 1-12) into the bottom-row stash, so the only items
+-- turtle.craft will see are the ones we arrange into the grid for this step
+local function clearArea()
   local ok = true
-  for _, s in ipairs(GRID) do
-    if turtle.getItemCount(s) > 0 and not clearGridSlot(s) then ok = false end
+  for s = 1, 12 do
+    if turtle.getItemCount(s) > 0 then
+      turtle.select(s)
+      for _, f in ipairs(STASH) do
+        if turtle.getItemCount(s) == 0 then break end
+        turtle.transferTo(f)
+      end
+      if turtle.getItemCount(s) > 0 then ok = false end
+    end
   end
   turtle.select(1)
   return ok
 end
 
--- gather up to `want` of `id` into grid slot `dst`, pulling only from non-grid slots so a grid
--- slot arranged earlier in the same step is never raided
+-- gather up to `want` of `id` into grid cell `dst`, pulling from the bottom-row stash (the region
+-- is cleared first, so every loose ingredient lives in the stash)
 local function gather(id, dst, want)
   local have = 0
   local d = turtle.getItemDetail(dst)
   if d and d.name == id then have = turtle.getItemCount(dst) end
-  for s = 1, 16 do
+  for _, s in ipairs(STASH) do
     if have >= want then break end
-    if s ~= dst and not gridSet[s] then
-      local sd = turtle.getItemDetail(s)
-      if sd and sd.name == id then
-        turtle.select(s)
-        turtle.transferTo(dst, want - have)
-        have = turtle.getItemCount(dst)
-      end
+    local sd = turtle.getItemDetail(s)
+    if sd and sd.name == id then
+      turtle.select(s)
+      turtle.transferTo(dst, want - have)
+      have = turtle.getItemCount(dst)
     end
   end
   return have
 end
 
--- arrange `chunk` of each ingredient into its grid slot for one recipe step; returns ok, reason
+-- arrange `chunk` of each ingredient into its grid cell for one recipe step; returns ok, reason
 local function arrange(grid, chunk)
-  if not clearGrid() then return false, "inv full" end
+  if not clearArea() then return false, "inv full" end
   for slot, id in pairs(grid) do
     if gather(id, slot, chunk) < chunk then return false, "need " .. shortId(id) end
   end
   return true
 end
 
-local function freeOutSlot(out)                       -- empty scratch slot (or one already holding `out`)
-  for _, f in ipairs(FREE) do
+local function freeOutSlot(out)                       -- empty stash slot (or one already holding `out`)
+  for _, f in ipairs(STASH) do
     local d = turtle.getItemDetail(f)
     if not d or d.name == out then return f end
   end
@@ -145,8 +143,6 @@ local function freeOutSlot(out)                       -- empty scratch slot (or 
 end
 
 ----------------------------------------------------------------- craft
--- one recipe step: craft `step.batches` times, chunked so neither a grid slot (<=64) nor the
--- output stack (<=64) overflows. intermediates stay in the inventory for later steps.
 -- run one recipe step; returns ok, reason. reason is short on failure: "bad recipe (relearn)"
 -- (grid didn't match a recipe), "need <item>" (ingredient short), "inv full", "no crafting table".
 -- crafts ONE application at a time (1 of each ingredient per slot, turtle.craft(1)) - exactly what
