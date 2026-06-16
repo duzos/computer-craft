@@ -1382,10 +1382,17 @@ end
 
 local function askField(label, required)
   while true do
-    write(label .. ": ")
+    write(label .. " (? lists invs): ")
     local s = (read() or ""):gsub("^%s*(.-)%s*$", "%1")
-    if s ~= "" or not required then return s end
-    print("  required")
+    if s == "?" then
+      local invs = listNetInvs()
+      if #invs > 0 then for _, n in ipairs(invs) do print("  " .. n) end
+      else print("  (no networked inventories seen)") end
+    elseif s ~= "" or not required then
+      return s
+    else
+      print("  required")
+    end
   end
 end
 
@@ -1405,14 +1412,7 @@ local function loadOrAskCfg()
     end
   end
   print("store first boot - name the barrels (wired-modem names).")
-  local invs = listNetInvs()
-  if #invs > 0 then
-    print("inventories on the network:")
-    for _, n in ipairs(invs) do print("  " .. n) end
-  else
-    print("(no networked inventories seen - check the modems)")
-  end
-  print("blank = none/disabled; the I/O barrel is required.")
+  print("type ? at a prompt to list networked inventories; blank = none/disabled.")
   IO_BARREL      = askField("I/O barrel", true)
   MANAGER_BARREL = askField("manager buffer barrel (blank = no manager)", false)
   MANAGER_DIR    = askField("manager face [up]", false)
