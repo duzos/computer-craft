@@ -125,15 +125,6 @@ local function gather(id, dst, want)
   return have
 end
 
--- arrange `chunk` of each ingredient into its grid cell for one recipe step; returns ok, reason
-local function arrange(grid, chunk)
-  if not clearArea() then return false, "inv full" end
-  for slot, id in pairs(grid) do
-    if gather(id, slot, chunk) < chunk then return false, "need " .. shortId(id) end
-  end
-  return true
-end
-
 local function freeOutSlot(out)                       -- empty stash slot (or one already holding `out`)
   for _, f in ipairs(STASH) do
     local d = turtle.getItemDetail(f)
@@ -142,36 +133,55 @@ local function freeOutSlot(out)                       -- empty stash slot (or on
   return nil
 end
 
+local function dropAllToFront()                       -- return everything to craftIn (front; not pooled)
+  for s = 1, 16 do
+    if turtle.getItemCount(s) > 0 then turtle.select(s); turtle.drop() end
+  end
+  turtle.select(1)
+end
+
 ----------------------------------------------------------------- craft
--- run one recipe step; returns ok, reason. reason is short on failure: "bad recipe (relearn)"
--- (grid didn't match a recipe), "need <item>" (ingredient short), "inv full", "no crafting table".
--- crafts ONE application at a time (1 of each ingredient per slot, turtle.craft(1)) - exactly what
--- `crafter learn` does. turtle.craft rejects the batched form (limit>1 / >1 per slot stacked).
-local function runStep(step)
+-- craft ONE application of `grid`. turtle.craft scans the WHOLE inventory and (for shapeless recipes)
+-- demands it hold EXACTLY the recipe items - any extra item makes the match fail. so materials buffer
+-- in craftIn (front; the store never vacuums it): suck them in, keep only this recipe's items, return
+-- everything else to craftIn, craft, then return the output to craftIn too. returns ok, reason.
+local function craftOne(grid)
   if not turtle.craft then return false, "no crafting table" end
+  while turtle.suck() do end                          -- pull the whole material buffer from craftIn
+  if not clearArea() then dropAllToFront(); return false, "inv full" end
+  for slot, id in pairs(grid) do
+    if gather(id, slot, 1) < 1 then dropAllToFront(); return false, "need " .. shortId(id) end
+  end
+  for s = 1, 16 do                                    -- everything that isn't an arranged cell -> craftIn
+    if not grid[s] and turtle.getItemCount(s) > 0 then turtle.select(s); turtle.drop() end
+  end
+  local out                                           -- output to an empty bottom-row slot (now clear)
+  for _, s in ipairs(STASH) do if turtle.getItemCount(s) == 0 then out = s; break end end
+  turtle.select(out or 13)
+  if not turtle.craft(1) then
+    local g = {}
+    for s = 1, 16 do local d = turtle.getItemDetail(s); if d then g[#g + 1] = s .. ":" .. shortId(d.name) end end
+    print("craft rejected; inv " .. (#g > 0 and table.concat(g, " ") or "empty"))
+    dropAllToFront()
+    return false, "bad recipe (relearn)"
+  end
+  dropAllToFront()                                    -- output + remnants back to craftIn for the next craft
+  return true
+end
+
+-- run one recipe step; returns ok, reason: "bad recipe (relearn)", "need <item>", "inv full",
+-- "no crafting table".
+local function runStep(step)
   for done = 1, step.batches do
-    local ok, why = arrange(step.grid, 1)
+    local ok, why = craftOne(step.grid)
     if not ok then return false, why end
-    local out = freeOutSlot(step.out)
-    if not out then return false, "inv full" end
-    turtle.select(out)
-    if not turtle.craft(1) then
-      local g = {}                                      -- show the WHOLE inventory (slot:item) when rejected
-      for s = 1, 16 do
-        local d = turtle.getItemDetail(s)
-        if d then g[#g + 1] = s .. ":" .. shortId(d.name) end
-      end
-      print("craft rejected; inv " .. (#g > 0 and table.concat(g, " ") or "empty"))
-      return false, "bad recipe (relearn)"
-    end
     if step.batches > 8 and done % 8 == 0 then print(("    %d/%d"):format(done, step.batches)) end
   end
   return true
 end
 
 local function execute(steps)
-  dumpAll()                                           -- clean slate
-  while turtle.suck() do end                          -- pull all the raws the store pushed to craftIn
+  dumpAll()                                           -- clean the turtle (materials live in craftIn)
   local target = steps[#steps] and steps[#steps].out
   print(("crafting %s  (%d step%s)"):format(shortId(target), #steps, #steps == 1 and "" or "s"))
   local err
@@ -180,8 +190,9 @@ local function execute(steps)
     local ok, why = runStep(step)
     if not ok then err = shortId(step.out) .. ": " .. (why or "failed"); break end
   end
+  while turtle.suck() do end                          -- collect the buffer from craftIn...
   local made = target and countId(target) or 0
-  dumpAll()                                           -- finished goods + leftovers -> craftOut -> pool
+  dumpAll()                                           -- ...and drop everything to craftOut -> pool
   if err then print("FAILED " .. err) else print("done: made " .. made .. " x " .. shortId(target)) end
   return not err, made, err
 end
