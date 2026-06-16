@@ -84,6 +84,8 @@ local function ring8(id)     -- 8 of `id` around an empty centre (chest/furnace 
   return { [1]=id, [2]=id, [3]=id, [5]=id, [7]=id, [9]=id, [10]=id, [11]=id }
 end
 local function fill9(id) local g = {}; for _, s in ipairs({1,2,3,5,6,7,9,10,11}) do g[s] = id end; return g end
+local function plus(arm, mid) return { [2]=arm, [5]=arm, [6]=mid, [7]=arm, [10]=arm } end  -- 4 `arm` around `mid`
+local function ring8c(ring, mid) local g = ring8(ring); g[6] = mid; return g end           -- 8 `ring` around `mid`
 local SEED_RECIPES = {
   ["minecraft:spruce_planks"]  = { yield = 4, grid = { [1] = "minecraft:spruce_log" } },
   ["minecraft:spruce_slab"]    = { yield = 6, grid = { [1] = PLANK, [2] = PLANK, [3] = PLANK } },
@@ -100,7 +102,20 @@ local SEED_RECIPES = {
   ["minecraft:hopper"]         = { yield = 1, grid = { [1]="minecraft:iron_ingot", [3]="minecraft:iron_ingot",
                                                        [5]="minecraft:iron_ingot", [6]="minecraft:chest", [7]="minecraft:iron_ingot",
                                                        [10]="minecraft:iron_ingot" } },
+  -- CC networking parts: stone (smelted from cobblestone, see SMELT_RECIPES) around redstone.
+  -- cable yield is the uncertain value here; relearn with `crafter learn` if 6 is wrong for your version.
+  ["computercraft:cable"]       = { yield = 6, grid = plus("minecraft:stone", "minecraft:redstone") },
+  ["computercraft:wired_modem"] = { yield = 1, grid = ring8c("minecraft:stone", "minecraft:redstone") },
 }
+-- furnace-smelt conversions the planner may request (output <- input, 1:1 via the Create smelt
+-- barrel). the auto-smelted raws (iron/copper/gold/zinc) are deliberately excluded - they're kept
+-- stocked by AUTO.smelt, so the planner never needs to smelt them itself. the input must be raw
+-- stock (no recursive crafting/smelting of a smelt input in v1).
+local SMELT_RECIPES = {
+  ["minecraft:stone"] = "minecraft:cobblestone",
+  ["minecraft:glass"] = "minecraft:sand",
+}
+local SMELT_TIMEOUT = 60     -- seconds to wait for a smelt phase before aborting the craft job
 local monitor, chatBox, manager
 local monitors = {}          -- all monitors, biggest first
 local monAssign = {}         -- monitor network-name -> "quarry"|"store"|"blank" (unset = auto by size)
@@ -571,9 +586,11 @@ local function onTelem(id, t, dist)
       crafterIn = t.craftIn; crafterInDirty = true  -- worker re-runs discover() to keep craftIn out of the pool
     end
     -- re-arm a latched job only if its plan was genuinely lost (dropped reply / crafter reboot).
-    -- NOT while a craftdone for it is still queued: the crafter can report idle in the window
-    -- before the worker settles the job, and re-arming there would re-run an empty craft + double-deliver.
-    if craftJob and t.phase == "idle" and pendingCmd[id] == nil and not craftDonePending(id) then
+    -- guarded so it can't fire (a) in the smelt phase, when no plan has been sent yet and craftIn
+    -- is empty, or (b) while a craftdone is still queued, before the worker settles the job - both
+    -- would re-run an empty craft.
+    if craftJob and craftJob.phase == "craft" and t.phase == "idle"
+        and pendingCmd[id] == nil and not craftDonePending(id) then
       pendingCmd[id] = { type = "craftplan", steps = craftJob.plan.steps }
     end
   end
@@ -675,6 +692,7 @@ end
 -- does not split a single non-stacking ingredient across slots (buckets etc. unsupported, v1).
 local function planCraft(id, qty, force)
   local have, pull, missing = {}, {}, {}
+  local smeltIn, smeltOut = {}, {}                      -- input->qty to push to the smelt barrel; output->qty awaited
   for iid, e in pairs(index.items) do have[iid] = e.count end
   if force then have[id] = 0 end                        -- `craft <id> n`: make N new even if some are stocked
   local steps, stack = {}, {}
@@ -683,27 +701,41 @@ local function planCraft(id, qty, force)
     local take = math.min(have[want] or 0, n)
     have[want] = (have[want] or 0) - take
     if take > 0 then pull[want] = (pull[want] or 0) + take end
-    n = n - take
+    n = n - take                                        -- residual after using stock; smelt/craft cover only this
     if n <= 0 then return true end
     local r = recipes[want]
-    if not r or stack[want] or depth > CRAFT_DEPTH then
-      missing[want] = (missing[want] or 0) + n
-      return false
+    if r and not stack[want] and depth <= CRAFT_DEPTH then
+      stack[want] = true
+      local batches = math.ceil(n / r.yield)
+      local ok = true
+      for ing, slots in pairs(gridDemand(r.grid)) do
+        if not need(ing, batches * slots, depth + 1) then ok = false end -- no break: collect all shortfalls
+      end
+      stack[want] = nil
+      if not ok then return false end
+      steps[#steps + 1] = { out = want, yield = r.yield, grid = r.grid, batches = batches }
+      have[want] = (have[want] or 0) + batches * r.yield - n             -- over-craft surplus feeds parents
+      return true
     end
-    stack[want] = true
-    local batches = math.ceil(n / r.yield)
-    local ok = true
-    for ing, slots in pairs(gridDemand(r.grid)) do
-      if not need(ing, batches * slots, depth + 1) then ok = false end   -- no break: collect all shortfalls
+    local sin = SMELT_RECIPES[want]                     -- no grid recipe: try the smelt path (1:1)
+    if sin then
+      if (have[sin] or 0) < n then                      -- smelt input must be in stock (no deeper recursion, v1)
+        missing[sin] = (missing[sin] or 0) + (n - (have[sin] or 0))
+        return false
+      end
+      have[sin] = have[sin] - n
+      smeltIn[sin]  = (smeltIn[sin] or 0) + n           -- push n input to the smelt barrel
+      smeltOut[want] = (smeltOut[want] or 0) + n        -- wait for n output to return to the pool
+      pull[want]    = (pull[want] or 0) + n             -- then pull it (with any stock) to craftIn
+      return true
     end
-    stack[want] = nil
-    if not ok then return false end
-    steps[#steps + 1] = { out = want, yield = r.yield, grid = r.grid, batches = batches }
-    have[want] = (have[want] or 0) + batches * r.yield - n               -- over-craft surplus feeds parents
-    return true
+    missing[want] = (missing[want] or 0) + n            -- neither craftable nor smeltable: raw shortfall
+    return false
   end
 
-  if need(id, qty, 0) then return { ok = true, steps = steps, pull = pull } end
+  if need(id, qty, 0) then
+    return { ok = true, steps = steps, pull = pull, smeltIn = smeltIn, smeltOut = smeltOut }
+  end
   return { ok = false, missing = missing }
 end
 
@@ -717,16 +749,25 @@ local function computeCraftable()
     if memo[id] ~= nil then return memo[id] end
     local stock = (index.items[id] and index.items[id].count) or 0
     local r = recipes[id]
-    if not r or stack[id] or depth > CRAFT_DEPTH then return stock end    -- raw / cycle: limited by stock
-    stack[id] = true
-    local best
-    for ing, slots in pairs(gridDemand(r.grid)) do
-      local out = math.floor(maxMake(ing, depth + 1) / slots) * r.yield
-      if not best or out < best then best = out end
+    if r and not stack[id] and depth <= CRAFT_DEPTH then
+      stack[id] = true
+      local best
+      for ing, slots in pairs(gridDemand(r.grid)) do
+        local out = math.floor(maxMake(ing, depth + 1) / slots) * r.yield
+        if not best or out < best then best = out end
+      end
+      stack[id] = nil
+      memo[id] = stock + (best or 0)
+      return memo[id]
     end
-    stack[id] = nil
-    memo[id] = stock + (best or 0)
-    return memo[id]
+    local sin = SMELT_RECIPES[id]                                        -- smeltable: 1:1 from its input
+    if sin and not stack[id] and depth <= CRAFT_DEPTH then
+      stack[id] = true
+      memo[id] = stock + maxMake(sin, depth + 1)
+      stack[id] = nil
+      return memo[id]
+    end
+    return stock                                                         -- raw / cycle / depth: limited by stock
   end
   local cache = {}
   for id in pairs(recipes) do cache[id] = maxMake(id, 0) end
@@ -743,18 +784,43 @@ end
 
 local function crafterReady() return crafterId ~= nil and crafterIn ~= nil and crafterIn ~= "" end
 
--- plan, deliver the raws to craftIn, latch the job, queue the plan as the crafter's
--- next telem reply; returns ok, message
+-- pull the plan's materials into craftIn and hand the craftplan to the crafter (the craft phase).
+-- callers MUST run this yield-free right after their index work, so onTelem can never observe a
+-- "craft" phase with pendingCmd still unset (pullEntry does not yield).
+local function armCraft(job)
+  for pid, n in pairs(job.plan.pull) do
+    local e = index.items[pid]
+    if e then pullEntry(pid, e, crafterIn, n) end
+  end
+  job.phase = "craft"
+  pendingCmd[crafterId] = { type = "craftplan", steps = job.plan.steps }
+end
+
+-- plan, then either hand straight to the crafter (no smelt) or enter the smelt phase first
+-- (push raws to the smelt barrel; craftTick waits for them and arms the craft). returns ok, message
 local function beginCraft(req)
   vacuumInputs(); ensureIndex()                         -- pool any just-deposited materials first
   local plan = planCraft(req.id, req.count, req.force)
   if not plan.ok then return false, craftShort(req.id, plan.missing) end
-  for pid, n in pairs(plan.pull) do
-    local e = index.items[pid]
-    if e then pullEntry(pid, e, crafterIn, n) end
+  local job = { id = req.id, count = req.count, dest = req.dest, plan = plan }
+  if next(plan.smeltOut) ~= nil then
+    if SMELT_BARREL == "" or not peripheral.isPresent(SMELT_BARREL) then
+      return false, "can't craft " .. shortId(req.id) .. ": needs a smelt but no smelt barrel"
+    end
+    for input, qty in pairs(plan.smeltIn) do
+      if deliverItem(SMELT_BARREL, input, qty) < qty then -- reality diverged from the plan copy: abort clean
+        return false, "short on " .. shortId(input) .. " to smelt for " .. shortId(req.id)
+      end
+    end
+    local parts = {}
+    for out, qty in pairs(plan.smeltOut) do parts[#parts + 1] = qty .. " " .. shortId(out) end
+    job.phase = "smelt"; job.smeltDeadline = os.clock() + SMELT_TIMEOUT
+    craftJob = job
+    logAction("smelting " .. table.concat(parts, ", ") .. " for " .. shortId(req.id))
+    return true, "smelting then crafting " .. req.count .. " x " .. shortId(req.id)
   end
-  craftJob = { id = req.id, count = req.count, dest = req.dest, plan = plan }
-  pendingCmd[crafterId] = { type = "craftplan", steps = plan.steps }
+  craftJob = job
+  armCraft(job)
   return true, "crafting " .. req.count .. " x " .. shortId(req.id)
 end
 
@@ -807,6 +873,29 @@ local function finishCraft(msg)
     end
   end
   startNextCraft()
+end
+
+-- advance a smelt-phase job: when the smelted outputs are back in the pool, pull + hand off to the
+-- crafter; abort if the smelt overruns SMELT_TIMEOUT (the smelted items stay in the pool, nothing lost).
+-- runs on the worker; the ensureIndex() yield is safe because the job is still phase "smelt" then
+-- (the re-arm guard requires "craft"), and the arm below runs yield-free after the gate.
+local function craftTick()
+  if not (craftJob and craftJob.phase == "smelt") then return end
+  ensureIndex()
+  for out in pairs(craftJob.plan.smeltOut) do
+    local e = index.items[out]
+    -- gate on pull[out] (= stock-portion + smelt-portion), not smeltOut[out]: armCraft pulls the
+    -- full pulled amount, so the pool must hold all of it, not just the freshly-smelted share
+    if not (e and e.count >= (craftJob.plan.pull[out] or 0)) then
+      if os.clock() > craftJob.smeltDeadline then
+        logAction("craft aborted: smelt timed out for " .. shortId(craftJob.id))
+        craftJob = nil; startNextCraft()
+      end
+      return
+    end
+  end
+  logAction("smelt done, crafting " .. craftJob.count .. " x " .. shortId(craftJob.id))
+  armCraft(craftJob)
 end
 
 local function handle(line, reply, origin)
@@ -1072,7 +1161,12 @@ local function handle(line, reply, origin)
     local parts = {}
     for id, r in pairs(recipes) do parts[#parts + 1] = shortId(id) .. " x" .. r.yield end
     table.sort(parts)
-    reply(#parts > 0 and (#parts .. " recipes: " .. table.concat(parts, ", ")) or "no recipes learned")
+    local smelts = {}
+    for out, inp in pairs(SMELT_RECIPES) do smelts[#smelts + 1] = shortId(out) .. "<-" .. shortId(inp) end
+    table.sort(smelts)
+    local msg = #parts > 0 and (#parts .. " recipes: " .. table.concat(parts, ", ")) or "no recipes learned"
+    if #smelts > 0 then msg = msg .. "  |  smelts: " .. table.concat(smelts, ", ") end
+    reply(msg)
   elseif cmd == "recipe" then
     local q = args[2] and args[2]:lower() or nil
     local id = (q and recipes[q]) and q or resolveCraftable(q)
@@ -1606,8 +1700,8 @@ end
 
 local function workerLoop()
   buildIndex()
-  local lastProc, lastSort, lastDash, lastVac, lastAlert, lastIdx, lastFull =
-    0, 0, 0, 0, 0, 0, 0
+  local lastProc, lastSort, lastDash, lastVac, lastAlert, lastIdx, lastFull, lastCraft =
+    0, 0, 0, 0, 0, 0, 0, 0
   while true do
     while #cmdQueue > 0 do
       local c = table.remove(cmdQueue, 1)
@@ -1621,6 +1715,7 @@ local function workerLoop()
     if now - lastFull  > 30 then indexDirty = true; lastFull = now end   -- periodic drift heal
     if now - lastIdx   > 1  then ensureIndex();    lastIdx   = now end   -- rebuild <=1/s, only if changed
     if now - lastProc  > 3  then processStep();    lastProc  = now end   -- uses the fresh index above
+    if now - lastCraft > 1  then craftTick();      lastCraft = now end   -- advance a smelt-phase craft job
     if now - lastAlert > 5  then checkAlerts();    lastAlert = now end
     if now - lastDash  > 1  then renderMonitors(); lastDash  = now end
     if #cmdQueue == 0 then sleep(0.3) else sleep(0) end  -- handle commands that landed mid-tick promptly
