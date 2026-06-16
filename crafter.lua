@@ -149,30 +149,26 @@ end
 -- output stack (<=64) overflows. intermediates stay in the inventory for later steps.
 -- run one recipe step; returns ok, reason. reason is short on failure: "bad recipe (relearn)"
 -- (grid didn't match a recipe), "need <item>" (ingredient short), "inv full", "no crafting table".
+-- crafts ONE application at a time (1 of each ingredient per slot, turtle.craft(1)) - exactly what
+-- `crafter learn` does. turtle.craft rejects the batched form (limit>1 / >1 per slot stacked).
 local function runStep(step)
   if not turtle.craft then return false, "no crafting table" end
-  local per = math.max(1, math.min(64, math.floor(64 / math.max(1, step.yield))))
-  local remaining = step.batches
-  local done = 0
-  while remaining > 0 do
-    local chunk = math.min(remaining, per)
-    local ok, why = arrange(step.grid, chunk)
+  for done = 1, step.batches do
+    local ok, why = arrange(step.grid, 1)
     if not ok then return false, why end
     local out = freeOutSlot(step.out)
     if not out then return false, "inv full" end
     turtle.select(out)
-    if not turtle.craft(chunk) then
+    if not turtle.craft(1) then
       local g = {}                                      -- show what was actually in the grid when rejected
       for _, gs in ipairs(GRID) do
         local d = turtle.getItemDetail(gs)
         if d then g[#g + 1] = gs .. ":" .. shortId(d.name) .. "x" .. d.count end
       end
-      print(("  craft(%d) rejected; grid %s"):format(chunk, #g > 0 and table.concat(g, " ") or "empty"))
+      print("  craft rejected; grid " .. (#g > 0 and table.concat(g, " ") or "empty"))
       return false, "bad recipe (relearn)"
     end
-    remaining = remaining - chunk
-    done = done + chunk
-    if step.batches > per then print(("    %d/%d"):format(done, step.batches)) end   -- chunked progress
+    if step.batches > 8 and done % 8 == 0 then print(("    %d/%d"):format(done, step.batches)) end
   end
   return true
 end
