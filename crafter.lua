@@ -160,12 +160,12 @@ local function runStep(step)
     if not out then return false, "inv full" end
     turtle.select(out)
     if not turtle.craft(1) then
-      local g = {}                                      -- show what was actually in the grid when rejected
-      for _, gs in ipairs(GRID) do
-        local d = turtle.getItemDetail(gs)
-        if d then g[#g + 1] = gs .. ":" .. shortId(d.name) .. "x" .. d.count end
+      local g = {}                                      -- show the WHOLE inventory (slot:item) when rejected
+      for s = 1, 16 do
+        local d = turtle.getItemDetail(s)
+        if d then g[#g + 1] = s .. ":" .. shortId(d.name) end
       end
-      print("  craft rejected; grid " .. (#g > 0 and table.concat(g, " ") or "empty"))
+      print("craft rejected; inv " .. (#g > 0 and table.concat(g, " ") or "empty"))
       return false, "bad recipe (relearn)"
     end
     if step.batches > 8 and done % 8 == 0 then print(("    %d/%d"):format(done, step.batches)) end
