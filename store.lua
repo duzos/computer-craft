@@ -56,6 +56,7 @@ local PROC_SET = {}   -- barrel name -> type, for discovery exclusion
 for t, n in pairs(PROC_BARREL) do PROC_SET[n] = t end
 
 local STORE_PROTOCOL = "store"   -- fleet protocol; turtles/pad address messages to "store"
+local GPS_PROTO      = "gps"     -- stations (gps towers + boiler) reboot on a broadcast on this proto
 local STORE_HOSTNAME = "store"   -- name this computer answers to over comms
 local RADIO_FREQ     = 1000      -- ClassicPeripherals radio frequency; turtles must match
 local TOWER_RANGE    = 0         -- 0 = auto from the tower's getHeight; set a number to override
@@ -87,7 +88,7 @@ local function storeState(name)
   return s
 end
 local turtles  = {}          -- id -> telemetry + lastHeard/eta/lastProgress
-local pendingCmd = {}        -- id -> "rtb"|"continue"
+local pendingCmd = {}        -- id -> "rtb"|"continue"|"reboot"
 local cmdQueue = {}
 local mode = "SORT"          -- SORT (auto-eat barrel) | WAIT (holding a pickup)
 local lastSnap = nil
@@ -778,12 +779,30 @@ local function handle(line, reply, origin)
     reply(("%d items, %d types, %d/%d slots used")
       :format(index.totalItems, index.types, index.usedSlots, index.totalSlots))
   elseif cmd == "reboot" then
-    reply("rebooting store")
-    logAction(line)
-    sleep(0.5)                 -- let the reply flush to chat/comms before the process dies
-    os.reboot()
+    local what = (args[2] or "store"):lower()
+    if what == "store" then
+      reply("rebooting store")
+      logAction(line)
+      sleep(0.5)               -- let the reply flush to chat/comms before the process dies
+      os.reboot()
+    elseif what == "fleet" or what == "stations" or what == "all" then
+      local out = {}
+      if what == "fleet" or what == "all" then           -- turtles: latched, applied at next check-in
+        local ids = resolveTurtles("all")
+        for _, id in ipairs(ids) do pendingCmd[id] = "reboot" end
+        out[#out + 1] = #ids .. " turtle(s)"
+      end
+      if what == "stations" or what == "all" then          -- gps towers + boiler: gps-proto broadcast
+        for _ = 1, 3 do comms.send("all", { type = "reboot" }, GPS_PROTO); sleep(0.15) end
+        out[#out + 1] = "towers+boiler"
+      end
+      logAction(line)
+      reply("reboot sent to " .. table.concat(out, " + ") .. " (reboot the store by hand)")
+    else
+      reply("usage: reboot [store|fleet|stations|all]")
+    end
   elseif cmd == "help" then
-    reply("sort | get <id> [n] | withdraw <id> [n] | deposit [id|all] [n] | process <smelt|cook|wash> <id> [n] | smelt <id> [n] | rtb [id|all] | continue [id|all] | auto <type> add|remove <id> | fuel <name> [n] | find <text> | list | mark <name> <input|output|storage|fuel> | marks | invs | reboot")
+    reply("sort | get <id> [n] | withdraw <id> [n] | deposit [id|all] [n] | process <smelt|cook|wash> <id> [n] | smelt <id> [n] | rtb [id|all] | continue [id|all] | auto <type> add|remove <id> | fuel <name> [n] | find <text> | list | mark <name> <input|output|storage|fuel> | marks | invs | reboot [store|fleet|stations|all]")
   else
     reply("unknown command: " .. cmd)
   end

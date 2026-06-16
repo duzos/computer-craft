@@ -68,10 +68,18 @@ local function load()
 end
 local function setPhase(p) state.phase = p; save() end
 
+-- a queued "reboot" from the store is honored wherever we read a reply. replies are read
+-- only between completed moves, and every move persists state, so a reboot resumes via
+-- recover() from a consistent position (with freshly pulled code). guard save() if unset.
+local function rebootIfAsked(body)
+  if body == "reboot" then if state then save() end; os.reboot() end
+end
+
 ----------------------------------------------------------------- comms
 local function request(cmd)
   comms.send(STORE_NAME, cmd, STORE_PROTOCOL)
   local m = comms.receive(STORE_PROTOCOL, 1.5)
+  rebootIfAsked(m and m.body)
   return m and m.body
 end
 
@@ -104,6 +112,7 @@ local function checkin(phase)
   }, STORE_PROTOCOL)
   local r = comms.receive(STORE_PROTOCOL, 0.3)
   local body = r and r.body
+  rebootIfAsked(body)
   if body == "rtb" then state.halted = true; save()
   elseif body == "continue" then state.halted = false; save() end
   return body

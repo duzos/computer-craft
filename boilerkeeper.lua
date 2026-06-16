@@ -17,6 +17,7 @@ local REQ_COOLDOWN = 15      -- min seconds between store requests
 
 local STORE_NAME     = "store"
 local STORE_PROTOCOL = "store"
+local GPS_PROTO      = "gps"   -- stations reboot broadcast rides this proto, so it can't crowd turtle check-ins
 local RADIO_FREQ     = 1000
 
 ----------------------------------------------------------------- helpers
@@ -69,7 +70,14 @@ local function main()
       print(("%d -> %d  (%s)"):format(have, after, tostring(reply)))
       if after < FLOOR then alert("charcoal below floor; store pool may be out of charcoal") end
     end
-    sleep(CHECK_EVERY)
+    -- idle until the next check, but reboot promptly on a stations reboot broadcast
+    local deadline = os.clock() + CHECK_EVERY
+    while true do
+      local left = deadline - os.clock()
+      if left <= 0 then break end
+      local m = comms.receive(GPS_PROTO, left)
+      if m and type(m.body) == "table" and m.body.type == "reboot" then os.reboot() end
+    end
   end
 end
 

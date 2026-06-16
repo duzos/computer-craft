@@ -70,6 +70,14 @@ local function save()
   local f = fs.open(STATE_FILE, "w"); f.write(textutils.serialize(state)); f.close()
 end
 
+-- a queued "reboot" from the store is honored wherever we read a store reply. replies are
+-- only read between completed moves, and every move persists state, so a reboot resumes
+-- from a fully consistent saved position (and picks up freshly pulled code on the way up).
+-- guard save(): replies are also read during early announce(), before state exists.
+local function rebootIfAsked(reply)
+  if reply == "reboot" then if state then save() end; os.reboot() end
+end
+
 local function load()
   if not fs.exists(STATE_FILE) then return false end
   local f = fs.open(STATE_FILE, "r"); state = textutils.unserialize(f.readAll()); f.close()
@@ -275,7 +283,9 @@ local function storeCmd(line)
   if not comms.up() then return nil end
   comms.send("store", line, STORE_PROTOCOL)
   local r = comms.receive(STORE_PROTOCOL, 5)
-  return r and r.body
+  local body = r and r.body
+  rebootIfAsked(body)
+  return body
 end
 
 local function announce()
@@ -345,6 +355,7 @@ local function checkin()
     last = lastBlock, halted = (state.phase == "recalled"),
   }, STORE_PROTOCOL)
   local r = comms.receive(STORE_PROTOCOL, 1.5)
+  rebootIfAsked(r and r.body)
   if r and type(r.body) == "string" and r.body ~= "ok" then return r.body end
   return nil
 end

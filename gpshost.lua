@@ -44,6 +44,7 @@ local function askNum(label)
 end
 
 local args = { ... }
+local cohost = (args[1] == "cohost")   -- launched by the store's startup; its reboot is the store's job
 if args[1] == "reset" and fs.exists(STATE_FILE) then fs.delete(STATE_FILE) end
 
 local POS = loadPos()
@@ -61,7 +62,11 @@ print(("gps host #%d at (%d,%d,%d) on '%s' -- Ctrl+T to quit")
 
 while true do
   local m = comms.receive(GPS_PROTO)
-  if m and type(m.body) == "table" and m.body.type == "gpsq" then
-    comms.send(m.from, { type = "gpsr", pos = POS }, GPS_PROTO)
+  if m and type(m.body) == "table" then
+    if m.body.type == "gpsq" then
+      comms.send(m.from, { type = "gpsr", pos = POS }, GPS_PROTO)
+    elseif m.body.type == "reboot" and not cohost then
+      os.reboot()   -- fleet reboot broadcast: standalone towers cycle to pick up new code
+    end
   end
 end
