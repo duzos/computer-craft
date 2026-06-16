@@ -161,7 +161,15 @@ local function runStep(step)
     local out = freeOutSlot(step.out)
     if not out then return false, "inv full" end
     turtle.select(out)
-    if not turtle.craft(chunk) then return false, "bad recipe (relearn)" end
+    if not turtle.craft(chunk) then
+      local g = {}                                      -- show what was actually in the grid when rejected
+      for _, gs in ipairs(GRID) do
+        local d = turtle.getItemDetail(gs)
+        if d then g[#g + 1] = gs .. ":" .. shortId(d.name) .. "x" .. d.count end
+      end
+      print(("  craft(%d) rejected; grid %s"):format(chunk, #g > 0 and table.concat(g, " ") or "empty"))
+      return false, "bad recipe (relearn)"
+    end
     remaining = remaining - chunk
     done = done + chunk
     if step.batches > per then print(("    %d/%d"):format(done, step.batches)) end   -- chunked progress
