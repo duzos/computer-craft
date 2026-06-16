@@ -4,27 +4,40 @@
 -- commands work on the terminal and in chat (prefixed). e.g.  get raw_iron 64
 
 local comms = require("comms")
+local args = { ... }
 
 ----------------------------------------------------------------- config
-local IO_BARREL  = "minecraft:barrel_0"   -- SET THIS: right-click the I/O barrel's modem for its name
+-- device/placement-specific barrels are prompted on first boot and saved to store.cfg
+-- (run 'store reset' to re-enter); fleet-wide constants and tuning live below.
 -- chat commands: prefix with $ in chat (the chat box hides it and fires a hidden event)
-
+local CFG_FILE = "store.cfg"
+local IO_BARREL                                    -- I/O barrel (required)
 -- inventory manager (optional): a buffer barrel must physically TOUCH the manager and
 -- also be wired to the network. the controller fills/empties it; the manager hands it to you.
-local MANAGER_BARREL = "minecraft:barrel_9"   -- SET: the buffer barrel touching the manager
-local MANAGER_DIR    = "up"                   -- face of the manager that barrel sits on
-
+local MANAGER_BARREL                               -- buffer barrel touching the manager
+local MANAGER_DIR                                  -- face of the manager that barrel sits on
 -- Create fan processing barrels: the store pushes items into one of three input
 -- barrels, the fans process them (smelt = lava/blasting incl. logs->charcoal,
 -- cook = fire/smoking, wash = water/splashing) and the results land in OUT_BARREL,
 -- which is vacuumed back into the pool like an input chest.
-local COOK_BARREL  = "minecraft:barrel_27"   -- fan over fire  (smoking: food)
-local SMELT_BARREL = "minecraft:barrel_28"   -- fan over lava  (blasting: ores, logs->charcoal)
-local WASH_BARREL  = "minecraft:barrel_29"   -- fan over water (splashing)
-local OUT_BARREL   = "minecraft:barrel_30"   -- collects all three outputs; vacuumed into the pool
+local COOK_BARREL, SMELT_BARREL, WASH_BARREL, OUT_BARREL
 
-local PROC_BARREL = { smelt = SMELT_BARREL, cook = COOK_BARREL, wash = WASH_BARREL }
 local PROC_TYPES  = { "smelt", "cook", "wash" }   -- display/iteration order
+local PROC_BARREL = {}            -- type -> barrel name; filled from config by applyProcTables
+local SPECIAL_ROLE = {}           -- barrel name -> fixed role label (shown in invs/marks)
+local PROC_SET = {}               -- barrel name -> type, for discovery exclusion
+
+-- (re)build the config-derived tables once the barrel names are known
+local function applyProcTables()
+  PROC_BARREL  = { smelt = SMELT_BARREL, cook = COOK_BARREL, wash = WASH_BARREL }
+  SPECIAL_ROLE = {}
+  if SMELT_BARREL ~= "" then SPECIAL_ROLE[SMELT_BARREL] = "smelt" end
+  if COOK_BARREL  ~= "" then SPECIAL_ROLE[COOK_BARREL]  = "cook"  end
+  if WASH_BARREL  ~= "" then SPECIAL_ROLE[WASH_BARREL]  = "wash"  end
+  if OUT_BARREL   ~= "" then SPECIAL_ROLE[OUT_BARREL]   = "out"   end
+  PROC_SET = {}
+  for t, n in pairs(PROC_BARREL) do if n ~= "" then PROC_SET[n] = t end end
+end
 
 -- per-type idle auto-processing sets (config = initial seed; persisted to AUTO_FILE).
 -- spruce logs are deliberately NOT auto-smelted: treefarm owns the keep/charcoal ratio.
@@ -46,14 +59,6 @@ local FUELS = {
   ["minecraft:coal"]     = true,
   ["minecraft:charcoal"] = true,
 }
-
--- special (constant-named) inventories shown in invs/marks with a fixed role label
-local SPECIAL_ROLE = {
-  [SMELT_BARREL] = "smelt", [COOK_BARREL] = "cook", [WASH_BARREL] = "wash",
-  [OUT_BARREL]   = "out",
-}
-local PROC_SET = {}   -- barrel name -> type, for discovery exclusion
-for t, n in pairs(PROC_BARREL) do PROC_SET[n] = t end
 
 local STORE_PROTOCOL = "store"   -- fleet protocol; turtles/pad address messages to "store"
 local GPS_PROTO      = "gps"     -- stations (gps towers + boiler) reboot on a broadcast on this proto
@@ -1366,8 +1371,70 @@ local function commsLoop()
   end
 end
 
+----------------------------------------------------------------- config (first boot)
+local function listNetInvs()
+  local out = {}
+  for _, n in ipairs(peripheral.getNames()) do
+    if not SIDES[n] and peripheral.hasType(n, "inventory") then out[#out + 1] = n end
+  end
+  return out
+end
+
+local function askField(label, required)
+  while true do
+    write(label .. ": ")
+    local s = (read() or ""):gsub("^%s*(.-)%s*$", "%1")
+    if s ~= "" or not required then return s end
+    print("  required")
+  end
+end
+
+local function loadOrAskCfg()
+  if fs.exists(CFG_FILE) then
+    local f = fs.open(CFG_FILE, "r"); local t = textutils.unserialize(f.readAll()); f.close()
+    if type(t) == "table" and type(t.io) == "string" and t.io ~= "" then
+      IO_BARREL      = t.io
+      MANAGER_BARREL = t.manager or ""
+      MANAGER_DIR    = t.managerDir or "up"
+      SMELT_BARREL   = t.smelt or ""
+      COOK_BARREL    = t.cook or ""
+      WASH_BARREL    = t.wash or ""
+      OUT_BARREL     = t.out or ""
+      applyProcTables()
+      return
+    end
+  end
+  print("store first boot - name the barrels (wired-modem names).")
+  local invs = listNetInvs()
+  if #invs > 0 then
+    print("inventories on the network:")
+    for _, n in ipairs(invs) do print("  " .. n) end
+  else
+    print("(no networked inventories seen - check the modems)")
+  end
+  print("blank = none/disabled; the I/O barrel is required.")
+  IO_BARREL      = askField("I/O barrel", true)
+  MANAGER_BARREL = askField("manager buffer barrel (blank = no manager)", false)
+  MANAGER_DIR    = askField("manager face [up]", false)
+  if MANAGER_DIR == "" then MANAGER_DIR = "up" end
+  SMELT_BARREL   = askField("smelt barrel - lava fan (blank = none)", false)
+  COOK_BARREL    = askField("cook barrel - fire fan (blank = none)", false)
+  WASH_BARREL    = askField("wash barrel - water fan (blank = none)", false)
+  OUT_BARREL     = askField("fan output barrel (blank = none)", false)
+  local f = fs.open(CFG_FILE, "w")
+  f.write(textutils.serialize({
+    io = IO_BARREL, manager = MANAGER_BARREL, managerDir = MANAGER_DIR,
+    smelt = SMELT_BARREL, cook = COOK_BARREL, wash = WASH_BARREL, out = OUT_BARREL,
+  }))
+  f.close()
+  applyProcTables()
+  print("saved to " .. CFG_FILE .. "  (run 'store reset' to re-enter)")
+end
+
 ----------------------------------------------------------------- main
 local function main()
+  if args[1] == "reset" and fs.exists(CFG_FILE) then fs.delete(CFG_FILE) end
+  loadOrAskCfg()
   loadRoles()
   loadAuto()
   loadMons()
@@ -1382,7 +1449,7 @@ local function main()
     for _, n in ipairs(peripheral.getNames()) do
       if peripheral.hasType(n, "inventory") and not SIDES[n] then print("  " .. n) end
     end
-    print("Set IO_BARREL at the top of this file to the right one.")
+    print("Run 'store reset' to re-enter the barrel names.")
     return
   end
   if #skipped > 0 then

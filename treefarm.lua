@@ -21,9 +21,11 @@ local STORE_PROTOCOL = "store"
 local STORE_NAME     = "store"
 local RADIO_FREQ     = 1000
 
-local FUEL_CHEST   = "minecraft:chest_20"     -- SET to your real names (see `invs` on the store)
-local SUPPLY_CHEST = "minecraft:chest_21"
-local LOG_CHEST    = "minecraft:chest_22"
+-- dock chest names are prompted on first boot and saved to treefarm.cfg (run
+-- 'treefarm reset' to re-enter); blank = standalone with no store link.
+local FUEL_CHEST   = ""    -- above the dock; store delivers fuel here
+local SUPPLY_CHEST = ""    -- behind the dock; store delivers saplings/bone meal here
+local LOG_CHEST    = ""    -- below the dock; auto-marked `input` on the store so logs vacuum to the pool
 
 local SAPLING_ID  = "minecraft:spruce_sapling"
 local BONEMEAL_ID = "minecraft:bone_meal"
@@ -37,6 +39,7 @@ local GROW_WAIT      = 25        -- seconds parked at the dock between growth pe
 local GROW_TRIES     = 120       -- peeks before refueling and re-waiting (~50 min)
 local BONEMEAL_POKES = 16        -- max bone meal applied per grow attempt before falling back
 local STATE_FILE     = "treefarm.state"
+local CFG_FILE       = "treefarm.cfg"   -- chest names, entered on first boot
 
 local args = { ... }
 local state
@@ -359,11 +362,43 @@ local function cycle()
   if not growAndFell() and not state.halted then print("tree did not grow this cycle") end
 end
 
+local function askChest(label)
+  write(label .. ": ")
+  local s = read() or ""
+  return (s:gsub("^%s*(.-)%s*$", "%1"))
+end
+
+local function loadOrAskCfg()
+  if fs.exists(CFG_FILE) then
+    local f = fs.open(CFG_FILE, "r"); local t = textutils.unserialize(f.readAll()); f.close()
+    if type(t) == "table" then
+      FUEL_CHEST   = t.fuel or ""
+      SUPPLY_CHEST = t.supply or ""
+      LOG_CHEST    = t.log or ""
+      return
+    end
+  end
+  print("first boot - name the dock chests (run 'invs' on the store for wired names).")
+  print("blank = run standalone with no store link.")
+  FUEL_CHEST   = askChest("fuel chest (above dock, marked fuel)")
+  SUPPLY_CHEST = askChest("supply chest (behind dock, saplings/bone meal)")
+  LOG_CHEST    = askChest("log chest (below dock, auto-marked input)")
+  local f = fs.open(CFG_FILE, "w")
+  f.write(textutils.serialize({ fuel = FUEL_CHEST, supply = SUPPLY_CHEST, log = LOG_CHEST }))
+  f.close()
+  print("saved to " .. CFG_FILE .. "  (run 'treefarm reset' to re-enter)")
+end
+
 local function main()
-  if args[1] == "reset" and fs.exists(STATE_FILE) then fs.delete(STATE_FILE) end
+  if args[1] == "reset" then
+    if fs.exists(STATE_FILE) then fs.delete(STATE_FILE) end
+    if fs.exists(CFG_FILE) then fs.delete(CFG_FILE) end
+  end
+  loadOrAskCfg()
   comms.open({ freq = RADIO_FREQ, proto = STORE_PROTOCOL })
   if not load() then state = fresh(); save() end
   if state.halted == nil then state.halted = false end
+  if LOG_CHEST ~= "" and comms.up() then request("mark " .. LOG_CHEST .. " input") end
   print("treefarm online (freq " .. RADIO_FREQ .. ", phase " .. state.phase .. ")")
   recover()
   while true do cycle() end

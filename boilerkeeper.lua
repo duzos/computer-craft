@@ -5,9 +5,13 @@
 -- the pool never vacuums the delivered charcoal back.
 
 local comms = require("comms")
+local args = { ... }
 
 ----------------------------------------------------------------- config
-local BUFFER       = "minecraft:barrel_26"   -- charcoal buffer the feed belt pulls from
+-- the buffer barrel is prompted on first boot and saved to boiler.cfg (run
+-- 'boilerkeeper reset' to re-enter).
+local CFG_FILE     = "boiler.cfg"
+local BUFFER       = ""                      -- charcoal buffer the feed belt pulls from
 local CHARCOAL_ID  = "minecraft:charcoal"
 local FLOOR        = 128     -- never want fewer than this (2 stacks)
 local TRIGGER      = 192     -- top up once the buffer dips below this (margin above FLOOR)
@@ -50,8 +54,34 @@ local function charcoalCount()
   return n
 end
 
+----------------------------------------------------------------- config (first boot)
+local function askBuffer()
+  while true do
+    write("buffer barrel name (run 'invs' on the store): ")
+    local s = (read() or ""):gsub("^%s*(.-)%s*$", "%1")
+    if s ~= "" then return s end
+    print("  name required")
+  end
+end
+
+local function loadOrAskCfg()
+  if fs.exists(CFG_FILE) then
+    local f = fs.open(CFG_FILE, "r"); local t = textutils.unserialize(f.readAll()); f.close()
+    if type(t) == "table" and type(t.buffer) == "string" and t.buffer ~= "" then
+      BUFFER = t.buffer
+      return
+    end
+  end
+  print("boilerkeeper first boot - name the charcoal buffer barrel.")
+  BUFFER = askBuffer()
+  local f = fs.open(CFG_FILE, "w"); f.write(textutils.serialize({ buffer = BUFFER })); f.close()
+  print("saved to " .. CFG_FILE .. "  (run 'boilerkeeper reset' to re-enter)")
+end
+
 ----------------------------------------------------------------- main
 local function main()
+  if args[1] == "reset" and fs.exists(CFG_FILE) then fs.delete(CFG_FILE) end
+  loadOrAskCfg()
   comms.open({ freq = RADIO_FREQ, proto = STORE_PROTOCOL })
   if not comms.up() then print("no radio/modem found; cannot reach the store"); return end
   print(("boilerkeeper online: %s  floor %d  trigger %d  target %d")

@@ -27,9 +27,11 @@ local STORE_PROTOCOL = "store"
 local STORE_NAME     = "store"
 local RADIO_FREQ     = 1000        -- must match the store's RADIO_FREQ
 
-local FUEL_CHEST   = "minecraft:chest_30"   -- SET to your real names (see `invs` on the store)
-local SUPPLY_CHEST = "minecraft:chest_31"
-local OUTPUT_CHEST = "minecraft:chest_32"   -- mark this `input` on the store so wheat/seeds vacuum into the pool
+-- dock chest names are prompted on first boot and saved to wheatfarm.cfg (run
+-- 'wheatfarm reset' to re-enter); blank = standalone with no store link.
+local FUEL_CHEST   = ""   -- left of the dock; store delivers fuel here
+local SUPPLY_CHEST = ""   -- behind the dock; store delivers seeds/bone meal here
+local OUTPUT_CHEST = ""   -- below the dock; auto-marked `input` so wheat/seeds vacuum into the pool
 
 local WIDTH  = 16
 local LENGTH = 16
@@ -48,6 +50,7 @@ local BONEMEAL_POKES = 16          -- max bone meal applied to one cell before g
 local SEED_KEEP     = 64           -- seeds held back on board for replanting
 local HAUL_FREE_MIN = 2            -- haul-and-deposit once free slots drop to this
 local STATE_FILE    = "wheatfarm.state"
+local CFG_FILE      = "wheatfarm.cfg"   -- chest names, entered on first boot
 
 local args = { ... }
 local state
@@ -402,12 +405,44 @@ local function cycle()
   growWait()
 end
 
+local function askChest(label)
+  write(label .. ": ")
+  local s = read() or ""
+  return (s:gsub("^%s*(.-)%s*$", "%1"))
+end
+
+local function loadOrAskCfg()
+  if fs.exists(CFG_FILE) then
+    local f = fs.open(CFG_FILE, "r"); local t = textutils.unserialize(f.readAll()); f.close()
+    if type(t) == "table" then
+      FUEL_CHEST   = t.fuel or ""
+      SUPPLY_CHEST = t.supply or ""
+      OUTPUT_CHEST = t.output or ""
+      return
+    end
+  end
+  print("first boot - name the dock chests (run 'invs' on the store for wired names).")
+  print("blank = run standalone with no store link.")
+  FUEL_CHEST   = askChest("fuel chest (left of dock, marked fuel)")
+  SUPPLY_CHEST = askChest("supply chest (behind dock, seeds/bone meal)")
+  OUTPUT_CHEST = askChest("output chest (below dock, auto-marked input)")
+  local f = fs.open(CFG_FILE, "w")
+  f.write(textutils.serialize({ fuel = FUEL_CHEST, supply = SUPPLY_CHEST, output = OUTPUT_CHEST }))
+  f.close()
+  print("saved to " .. CFG_FILE .. "  (run 'wheatfarm reset' to re-enter)")
+end
+
 local function main()
-  if args[1] == "reset" and fs.exists(STATE_FILE) then fs.delete(STATE_FILE) end
+  if args[1] == "reset" then
+    if fs.exists(STATE_FILE) then fs.delete(STATE_FILE) end
+    if fs.exists(CFG_FILE) then fs.delete(CFG_FILE) end
+  end
+  loadOrAskCfg()
   comms.open({ freq = RADIO_FREQ, proto = STORE_PROTOCOL })
   if not load() then state = fresh(); save() end
   if state.halted == nil then state.halted = false end
   if state.xdir == nil then state.xdir = 1 end
+  if OUTPUT_CHEST ~= "" and comms.up() then request("mark " .. OUTPUT_CHEST .. " input") end
   print(("wheatfarm online (freq %d, phase %s)"):format(RADIO_FREQ, state.phase))
   recover()
   while true do cycle() end
