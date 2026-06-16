@@ -4,6 +4,7 @@
 *.auto
 *.roles
 *.etag
+*.token
 
 # internal docs + server fingerprint - kept private
 CLAUDE.md

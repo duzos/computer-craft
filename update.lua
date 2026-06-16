@@ -18,12 +18,25 @@ local UA     = "cc-fleet-updater"            -- the github api rejects requests 
 local API = "https://api.github.com/repos/" .. REPO
 local RAW = "https://raw.githubusercontent.com/" .. REPO
 
+-- optional auth: a fine-grained, read-only PAT in update.token (gitignored, hand-placed
+-- per device) lifts the API limit from 60/hr to 5000/hr. absent = anonymous, still works.
+-- NEVER commit the token: this repo is public and github auto-revokes detected PATs.
+local TOKEN_FILE = "update.token"
+local function loadToken()
+  if not fs.exists(TOKEN_FILE) then return nil end
+  local f = fs.open(TOKEN_FILE, "r"); local t = f.readAll(); f.close()
+  t = t and t:gsub("%s", "") or ""          -- strip newline/whitespace a paste leaves behind
+  return #t > 0 and t or nil
+end
+local TOKEN = loadToken()
+
 -- returns body, http status code, response headers; accepts extra request headers
 -- (e.g. If-None-Match for a conditional GET). a non-2xx still yields its response
 -- handle in CC, so we read the code/headers off that too (304/403 carry no body).
 local function httpGet(url, extra)
   if not http then return nil end
   local headers = { ["User-Agent"] = UA }
+  if TOKEN then headers["Authorization"] = "Bearer " .. TOKEN end
   if extra then for k, v in pairs(extra) do headers[k] = v end end
   local h, _, errH = http.get(url, headers)
   local resp = h or errH
