@@ -1,0 +1,363 @@
+-- treefarm: 2x2 giant spruce harvester. bonemeals the saplings from a ground-level
+-- ring cell beside the pad (turtle stays off the trunk + canopy), with natural growth
+-- as the fallback; fells the trunk, deposits logs to the store pool, then asks the
+-- store to smelt SMELT_FRACTION of the haul into charcoal (the rest stays as logs).
+-- saplings + bone meal refill from the store pool -> SUPPLY_CHEST; decayed-leaf
+-- saplings wash off a water catch-floor under the canopy -> input-marked chest.
+--
+-- LAYOUT (dock = origin, facing the pad = +Z forward):
+--   dock at (x0,z0,y0); 2-block gap at z1,z2; 2x2 dirt at z3,z4 (dirt y-1, sapling y0)
+--   FUEL_CHEST   above the dock   (x0,z0,y+1)  -> suckUp + refuel
+--   SUPPLY_CHEST behind the dock  (x0,z-1,y0)  -> store delivers saplings here
+--   LOG_CHEST    below the dock   (x0,z0,y-1)  -> drop logs here (input-marked -> pool)
+--   catch floor  solid at y-2 under the canopy, water at y-1 -> hopper -> input chest
+-- the 2-block gap keeps the dock clear of the 5x5 growth column. chests on the store net.
+-- run: treefarm         (start / resume from saved state)
+--      treefarm reset    (wipe saved state; only when parked at the dock)
+
+local comms = require("comms")
+
+local STORE_PROTOCOL = "store"
+local STORE_NAME     = "store"
+local RADIO_FREQ     = 1000
+
+local FUEL_CHEST   = "minecraft:chest_20"     -- SET to your real names (see `invs` on the store)
+local SUPPLY_CHEST = "minecraft:chest_21"
+local LOG_CHEST    = "minecraft:chest_22"
+
+local SAPLING_ID  = "minecraft:spruce_sapling"
+local BONEMEAL_ID = "minecraft:bone_meal"
+local LOG_MATCH   = "log"
+local LOG_ID      = "minecraft:spruce_log"   -- canonical id sent to the store's process api
+local SMELT_FRACTION = 0.67                  -- fraction of each haul smelted to charcoal; rest kept as logs
+
+local FUEL_MIN   = 200
+local FUEL_FULL  = 1000      -- display cap for the Overview fuel bar
+local GROW_WAIT      = 25        -- seconds parked at the dock between growth peeks
+local GROW_TRIES     = 120       -- peeks before refueling and re-waiting (~50 min)
+local BONEMEAL_POKES = 16        -- max bone meal applied per grow attempt before falling back
+local STATE_FILE     = "treefarm.state"
+
+local args = { ... }
+local state
+
+----------------------------------------------------------------- state
+local function fresh()
+  return { pos = { x = 0, z = 0, y = 0 }, head = 0, phase = "idle", halted = false }
+end
+local function save()
+  local f = fs.open(STATE_FILE, "w"); f.write(textutils.serialize(state)); f.close()
+end
+local function load()
+  if not fs.exists(STATE_FILE) then return false end
+  local f = fs.open(STATE_FILE, "r"); state = textutils.unserialize(f.readAll()); f.close()
+  return state ~= nil
+end
+local function setPhase(p) state.phase = p; save() end
+
+----------------------------------------------------------------- comms
+local function request(cmd)
+  comms.send(STORE_NAME, cmd, STORE_PROTOCOL)
+  local m = comms.receive(STORE_PROTOCOL, 1.5)
+  return m and m.body
+end
+
+local alertAt = {}
+local function alert(kind)
+  local now = os.clock()
+  if alertAt[kind] and now - alertAt[kind] < 30 then return end
+  alertAt[kind] = now
+  if not comms.up() then return end
+  comms.send(STORE_NAME, { type = "alert", id = os.getComputerID(), label = os.getComputerLabel(), msg = kind, phase = state.phase }, STORE_PROTOCOL)
+end
+
+local function checkin(phase)
+  if phase then setPhase(phase) end
+  if not comms.up() then return nil end
+  local fl = turtle.getFuelLevel()
+  local fuel = (fl == "unlimited") and FUEL_FULL or math.min(fl, FUEL_FULL)
+  comms.send(STORE_NAME, {
+    type = "telem", kind = "tree", id = os.getComputerID(), label = os.getComputerLabel(),
+    phase = state.phase, fuel = fuel, fuelMax = FUEL_FULL,
+    pct = 0, halted = state.halted, pos = { x = state.pos.x, y = state.pos.y, z = state.pos.z },
+    harvests = state.harvests or 0, logs = state.lastLogs or 0,
+  }, STORE_PROTOCOL)
+  local r = comms.receive(STORE_PROTOCOL, 0.3)
+  local body = r and r.body
+  if body == "rtb" then state.halted = true; save()
+  elseif body == "continue" then state.halted = false; save() end
+  return body
+end
+
+----------------------------------------------------------------- movement (dead reckoned, persisted)
+local DIRS = { [0] = { x = 0, z = 1 }, [1] = { x = 1, z = 0 }, [2] = { x = 0, z = -1 }, [3] = { x = -1, z = 0 } }
+
+local function turnR() turtle.turnRight(); state.head = (state.head + 1) % 4; save() end
+local function face(h) while state.head ~= h do turnR() end end
+
+local function isProtected(name)
+  return name:find("chest", 1, true) ~= nil or name:find("barrel", 1, true) ~= nil or name:find("shulker_box", 1, true) ~= nil
+end
+
+local function fwd()
+  local n = 0
+  while turtle.detect() do
+    local ok, d = turtle.inspect(); if ok and d.name and isProtected(d.name) then return false end
+    if not turtle.dig() then turtle.attack() end
+    n = n + 1; if n > 40 then return false end
+  end
+  if turtle.forward() then
+    state.pos.x = state.pos.x + DIRS[state.head].x
+    state.pos.z = state.pos.z + DIRS[state.head].z
+    save(); return true
+  end
+  return false
+end
+
+local function up()
+  while turtle.detectUp() do
+    local ok, d = turtle.inspectUp(); if ok and d.name and isProtected(d.name) then return false end
+    if not turtle.digUp() then turtle.attackUp() end
+  end
+  if turtle.up() then state.pos.y = state.pos.y + 1; save(); return true end
+  return false
+end
+
+local function down()
+  while turtle.detectDown() do
+    local ok, d = turtle.inspectDown(); if ok and d.name and isProtected(d.name) then return false end
+    if not turtle.digDown() then turtle.attackDown() end
+  end
+  if turtle.down() then state.pos.y = state.pos.y - 1; save(); return true end
+  return false
+end
+
+local function goTo(tx, tz, ty)
+  if state.pos.x < tx then face(1) elseif state.pos.x > tx then face(3) end
+  while state.pos.x ~= tx do if not fwd() then break end end
+  if state.pos.z < tz then face(0) elseif state.pos.z > tz then face(2) end
+  while state.pos.z ~= tz do if not fwd() then break end end
+  while state.pos.y < ty do if not up() then break end end
+  while state.pos.y > ty do if not down() then break end end
+end
+
+local function home() goTo(0, 0, 0); face(0) end
+
+-- come back to the dock from the pad: descend in the gap first so the y+1 lane
+-- never collides with the fuel chest sitting directly above the dock.
+local function retreat()
+  if state.pos.y > 0 then
+    goTo(0, 1, state.pos.y)
+    while state.pos.y > 0 do if not down() then break end end
+  end
+  home()
+end
+
+----------------------------------------------------------------- inventory
+local function invCount(id)
+  local n = 0
+  for s = 1, 16 do local d = turtle.getItemDetail(s); if d and d.name == id then n = n + d.count end end
+  return n
+end
+local function selectItem(id)
+  for s = 1, 16 do local d = turtle.getItemDetail(s); if d and d.name == id then turtle.select(s); return true end end
+  return false
+end
+
+local function refuel()
+  if turtle.getFuelLevel() == "unlimited" or turtle.getFuelLevel() > FUEL_MIN then return end
+  request(("fuel %s 64"):format(FUEL_CHEST))
+  sleep(0.6)
+  for _ = 1, 8 do if not turtle.suckUp() then break end end
+  for s = 1, 16 do
+    local d = turtle.getItemDetail(s)
+    if d and (d.name == "minecraft:coal" or d.name == "minecraft:charcoal") then turtle.select(s); turtle.refuel() end
+  end
+  turtle.select(1)
+  if turtle.getFuelLevel() ~= "unlimited" and turtle.getFuelLevel() <= FUEL_MIN then alert("out of fuel") end
+end
+
+local function drawSupply()
+  request(("give %s %s 64"):format(SUPPLY_CHEST, SAPLING_ID))
+  request(("give %s %s 64"):format(SUPPLY_CHEST, BONEMEAL_ID))
+  sleep(0.4)
+  face(2)
+  for _ = 1, 16 do if not turtle.suck() then break end end
+  face(0)
+  print(("on hand: %d saplings, %d bonemeal"):format(invCount(SAPLING_ID), invCount(BONEMEAL_ID)))
+end
+
+----------------------------------------------------------------- pad ops
+local PAD = { { 0, 3 }, { 1, 3 }, { 0, 4 }, { 1, 4 } }
+
+-- plant all four from y+1, traversing above the saplings, then fully retreat off the pad
+local function plant()
+  goTo(0, 1, 0)                       -- into the gap
+  up()                                -- rise to y+1 in the gap, clear of the footprint
+  for _, c in ipairs(PAD) do
+    goTo(c[1], c[2], 1)
+    if selectItem(SAPLING_ID) then turtle.placeDown() end
+  end
+  retreat()
+end
+
+-- peek the NW trunk cell from the gap edge, then retreat: "log" | "sapling" | "empty"
+local function peek()
+  goTo(0, 2, 0); face(0)
+  local ok, d = turtle.inspect()
+  retreat()
+  if ok and d and d.name then
+    if d.name:find(LOG_MATCH, 1, true) then return "log" end
+    if d.name:find("sapling", 1, true) then return "sapling" end
+  end
+  return "empty"
+end
+
+local function waitGrow()
+  for _ = 1, GROW_TRIES do
+    if peek() == "log" then return true end
+    checkin("growing")
+    if state.halted then return false end       -- rtb during the wait: bail to cycle, which parks
+    sleep(GROW_WAIT)
+  end
+  return false
+end
+
+-- hit the NW sapling with bone meal from the ring cell; bonemealing one sapling of a
+-- valid 2x2 grows the whole tree. the turtle sits at (0,2) ground level, off the trunk
+-- and below the canopy, so it is not one of the cells the tree needs clear.
+local function bonemealPad()
+  if invCount(BONEMEAL_ID) == 0 then return false end
+  goTo(0, 2, 0); face(0)
+  local grown = false
+  for _ = 1, BONEMEAL_POKES do
+    local ok, d = turtle.inspect()
+    if ok and d and d.name and d.name:find(LOG_MATCH, 1, true) then grown = true; break end
+    if not selectItem(BONEMEAL_ID) then break end
+    turtle.place()
+    sleep(0.1)
+  end
+  if not grown then
+    local ok, d = turtle.inspect()
+    grown = (ok and d and d.name and d.name:find(LOG_MATCH, 1, true)) and true or false
+  end
+  turtle.select(1)
+  retreat()
+  return grown
+end
+
+-- trace the 2x2 at the current level, digging each column; returns true if a log was hit
+local function clearRing()
+  local got = false
+  for _ = 1, 4 do
+    local ok, d = turtle.inspect()
+    if ok and d.name and d.name:find(LOG_MATCH, 1, true) then got = true end
+    fwd()
+    turnR()
+  end
+  return got
+end
+
+local function fellTree()
+  goTo(0, 3, 0)                       -- enter the NW trunk column at the base
+  local climbed = 0
+  while true do
+    local got = clearRing()
+    local upLog = false
+    local ok, d = turtle.inspectUp()
+    if ok and d.name and d.name:find(LOG_MATCH, 1, true) then upLog = true end
+    if not got and not upLog then break end
+    if not up() then break end
+    climbed = climbed + 1
+    if climbed > 40 then break end
+  end
+  retreat()
+end
+
+-- drop the whole haul into the pool, then ask the store to smelt a fraction of it
+-- into charcoal (the rest stays as logs). the store vacuums the log chest before
+-- pulling, so the just-dropped logs are in the pool when it smelts them.
+local function depositLogs()
+  local logs = 0
+  for s = 1, 16 do
+    local d = turtle.getItemDetail(s)
+    if d and d.name:find(LOG_MATCH, 1, true) then logs = logs + d.count; turtle.select(s); turtle.dropDown() end
+  end
+  turtle.select(1)
+  if logs > 0 then
+    state.harvests = (state.harvests or 0) + 1   -- store stamps the time when this increments
+    state.lastLogs = logs
+    save()
+    local n = math.floor(logs * SMELT_FRACTION)
+    if n > 0 then request(("process smelt %s %d"):format(LOG_ID, n)) end
+  end
+end
+
+-- bone meal first (instant when the column is clear), natural growth as the fallback
+local function growAndFell()
+  if invCount(BONEMEAL_ID) < BONEMEAL_POKES then drawSupply() end
+  checkin("growing")
+  local grown = bonemealPad()
+  if not grown then grown = waitGrow() end
+  if not grown then return false end
+  checkin("felling"); fellTree()
+  checkin("hauling"); depositLogs()
+  return true
+end
+
+----------------------------------------------------------------- main
+-- resume from any saved position: descend out of a trunk, re-home, finish a partial fell
+local function recover()
+  if state.pos.x ~= 0 or state.pos.z ~= 0 or state.pos.y ~= 0 then
+    while state.pos.y > 0 do if not down() then break end end
+    home()
+  end
+  if state.phase == "felling" then fellTree(); depositLogs()
+  elseif state.phase == "hauling" then depositLogs() end
+  setPhase("idle")
+end
+
+-- rtb parks the farm at the dock and holds until continue; HALT shows on the Overview/pad
+local function holdIfHalted()
+  if not state.halted then return end
+  retreat()
+  while state.halted do
+    checkin("halted")
+    sleep(3)
+  end
+  checkin("idle")
+end
+
+local function cycle()
+  holdIfHalted()
+  refuel()
+  local st = peek()
+  if st == "log" then                 -- a grown (or leftover) trunk is standing: fell it
+    checkin("felling"); fellTree()
+    checkin("hauling"); depositLogs()
+    return
+  end
+  if st == "sapling" then             -- planted, not grown yet: bone meal it / wait
+    growAndFell()
+    return
+  end
+  checkin("idle")                     -- empty pad: plant a fresh 2x2
+  if invCount(SAPLING_ID) < 4 or invCount(BONEMEAL_ID) < BONEMEAL_POKES then drawSupply() end
+  if invCount(SAPLING_ID) < 4 then
+    alert("no saplings"); checkin("nosaplings"); print("no saplings available; waiting"); sleep(30); return
+  end
+  checkin("planting"); plant()
+  if not growAndFell() and not state.halted then print("tree did not grow this cycle") end
+end
+
+local function main()
+  if args[1] == "reset" and fs.exists(STATE_FILE) then fs.delete(STATE_FILE) end
+  comms.open({ freq = RADIO_FREQ, proto = STORE_PROTOCOL })
+  if not load() then state = fresh(); save() end
+  if state.halted == nil then state.halted = false end
+  print("treefarm online (freq " .. RADIO_FREQ .. ", phase " .. state.phase .. ")")
+  recover()
+  while true do cycle() end
+end
+
+main()

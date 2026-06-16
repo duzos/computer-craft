@@ -1,0 +1,10 @@
+# runtime state - lives on the in-game devices, never published
+*.state
+*.cfg
+*.auto
+*.roles
+
+# internal docs + server fingerprint - kept private
+CLAUDE.md
+IDEAS.md
+modlist.txt
