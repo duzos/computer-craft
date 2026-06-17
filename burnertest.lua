@@ -22,8 +22,11 @@ local RADIO_FREQ = 1000                 -- fleet radio freq, only used for the G
 
 local MAX_OUT    = 500   -- ceiling for max gas output (lower it if your burners cap below 500)
 local MIN_OUT    = 5     -- burner's minimum settable target
-local KP, KI, KD = 40, 5, 60
-local CONTROL_DT = 0.5   -- seconds between control ticks
+local KP, KI, KD = 12, 1.5, 25  -- altitude PID gains (gentler = less aggressive; tune in game)
+local OUT_SMOOTH = 0.3   -- 0..1 output slew per tick (lower = finer/gentler, more lag)
+local CONTROL_DT = 0.2   -- seconds between control ticks (lower = pings/corrects more often)
+local GPS_FIX_TIME = 1.0 -- GPS fallback: seconds per fix (lower = more frequent pings, noisier)
+local GPS_PINGS    = 4   -- GPS fallback: pings gathered per fix
 local Y_STEP     = 1     -- target-altitude nudge per key press
 
 local function findBurners()
@@ -146,7 +149,7 @@ local function makeAltSource()
   if okc then pcall(comms.open, { freq = RADIO_FREQ }) end
   return {
     kind = "gps(estimate)",
-    y  = function() local fix = gps2.tryFix(0); return fix and fix.y or nil end,
+    y  = function() local fix = gps2.locate(GPS_FIX_TIME, GPS_PINGS); return fix and fix.y or nil end,
     vs = function() return nil end,   -- GPS gives no vspeed; derived from successive Y in the loop
   }
 end
@@ -169,6 +172,7 @@ local function altitude(argY)
   print(("altitude hold engaging - target Y %d  (redstone on %s)")
     :format(targetY, table.concat(RS_SIDES, "+")))
   local integ = 0
+  local uPrev = 0
   local prevY, prevT = nil, nil
   local timer = os.startTimer(CONTROL_DT)
   while true do
@@ -185,7 +189,9 @@ local function altitude(argY)
         if not speed then speed = (prevY ~= nil) and ((cy - prevY) / dt) or 0 end
         local err = targetY - cy
         integ = clamp(integ + err * KI * dt, 0, MAX_OUT)
-        local u = clamp(KP * err - KD * speed + integ, 0, MAX_OUT)
+        local uRaw = clamp(KP * err - KD * speed + integ, 0, MAX_OUT)
+        local u = uPrev + OUT_SMOOTH * (uRaw - uPrev)
+        uPrev = u
         local sig, tgt = applyOutput(u)
         print(("target Y %d | now %s | err %+.1f | vspeed %+.2f")
           :format(targetY, fmt(cy), err, speed))
