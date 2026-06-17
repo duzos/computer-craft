@@ -139,6 +139,7 @@ local function isProtected(name)
   return name:find("chest", 1, true) ~= nil
       or name:find("barrel", 1, true) ~= nil
       or name:find("shulker_box", 1, true) ~= nil
+      or name:find("computercraft:", 1, true) == 1   -- never dig fleet/network blocks (computers, turtles, modems, cables, monitors)
 end
 
 local alertAt = {}
