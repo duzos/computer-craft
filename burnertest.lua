@@ -1,32 +1,40 @@
 -- burnertest.lua  --  Create: Avionics hot air burner (gas_provider) diagnostic + setter
 -- run on a computer touching the burner(s), or wired to them via a modem.
--- handles MULTIPLE burners (e.g. one left + one right): set/altitude drive all of them.
--- interactive (default): type a number (e.g. 310) to set the max hot air output; it reads back.
+-- handles MULTIPLE burners (e.g. left + right): set/altitude drive all of them.
 --   i / info       one-shot snapshot incl. the peripheral's real method list
 --   w / watch      live readout (press a key to stop)
 --   a / altitude   altitude-hold loop (see below)
 --   q              quit
--- one-shot from the shell too:  burnertest watch | burnertest set 310 | burnertest altitude 120
+-- shell one-shots:  burnertest watch | burnertest set 310 | burnertest altitude 120
 --
 -- ALTITUDE HOLD ("burnertest altitude [Y]"):
---   closed loop holding a world-Y by driving BOTH the redstone signal (0-15, on RS_SIDES) and
---   the max gas output (setTargetAmount). burner output = target * signal/15, so a PID picks a
---   desired output and splits it: signal = coarse band, target = fine trim within it.
---   altitude comes from an Avionics `altitude_sensor` if present; otherwise it falls back to the
---   radio-GPS (gps2) estimate - which is COARSE on Y (towers near-coplanar, ~6m off) and needs
---   the radio antenna. up/down (or +/-) nudge the target Y; q cuts redstone and exits.
---   the KP/KI/KD gains are guesses - tune them in game.
+--   holds a world-Y by driving BOTH the redstone signal (0-15, on RS_SIDES) and the max gas
+--   output (setTargetAmount); burner output = target*signal/15, split coarse(signal)/fine(target).
+--   Control is PREDICTIVE: it steers on where it WILL be in LOOKAHEAD seconds (cy + vspeed*LOOKAHEAD),
+--   so it eases off the throttle EARLY instead of chasing the laggy balloon - raise LOOKAHEAD to
+--   match how long the balloons take to fill. A gated integral finds the steady hover output, and
+--   OUT_SMOOTH slews the throttle so it never slams.
+--   Altitude/vspeed come from an Avionics altitude_sensor if present, else the radio-GPS (gps2,
+--   coarse on Y). X/Z for the readout come from the radio-GPS when available.
+--   If an advanced MONITOR is attached it shows a live dashboard (XYZ, vspeed, output, balloon) with
+--   touch -10/-1/+1/+10 buttons to set the target; the computer up/down or +/- keys also nudge it,
+--   q quits. Gains are guesses - tune in game.
 
 local RS_SIDES   = { "left", "right" }  -- sides the computer feeds redstone into the burners
-local RADIO_FREQ = 1000                 -- fleet radio freq, only used for the GPS altitude fallback
+local RADIO_FREQ = 1000                 -- fleet radio freq, used for the GPS altitude/position source
 
 local MAX_OUT    = 500   -- ceiling for max gas output (lower it if your burners cap below 500)
 local MIN_OUT    = 5     -- burner's minimum settable target
-local KP, KI, KD = 12, 1.5, 25  -- altitude PID gains (gentler = less aggressive; tune in game)
-local OUT_SMOOTH = 0.3   -- 0..1 output slew per tick (lower = finer/gentler, more lag)
-local CONTROL_DT = 0.2   -- seconds between control ticks (lower = pings/corrects more often)
-local GPS_FIX_TIME = 1.0 -- GPS fallback: seconds per fix (lower = more frequent pings, noisier)
-local GPS_PINGS    = 4   -- GPS fallback: pings gathered per fix
+local KP, KI     = 5, 1.0  -- predictive proportional gain; gated integral (hover-find) gain
+local LOOKAHEAD  = 5.0   -- s of prediction; RAISE to match balloon fill lag (the main "calm it down" knob)
+local OUT_SMOOTH = 0.25  -- 0..1 output slew per tick (lower = gentler/finer, more lag)
+local I_BAND     = 3     -- blocks: only build the hover integral within this of target...
+local I_VMAX     = 0.5   -- m/s: ...and slower than this (anti-windup during climbs)
+local CONTROL_DT = 0.2   -- seconds between control ticks
+local GPS_FIX_TIME = 1.0 -- GPS: seconds per fix (lower = more frequent, noisier)
+local GPS_PINGS    = 4   -- GPS: pings gathered per fix
+local GPS_REFRESH  = 3.0 -- GPS: how often to refresh X/Z for the readout when a sensor drives Y
+local MON_SCALE  = 0.5   -- monitor text scale (0.5 suits a short 1x3 monitor; raise for bigger ones)
 local Y_STEP     = 1     -- target-altitude nudge per key press
 
 local function findBurners()
@@ -120,102 +128,150 @@ local function setTarget(n)
     :format(n, #burners, fmt(callm(rep.p, "getTargetAmount"))))
 end
 
--- split a desired output u into (redstone signal, max gas target): output = target*signal/15.
--- signal is the coarse band, target the fine trim; applied to every burner / redstone side.
-local function applyOutput(u)
+-- split a desired output u into (redstone signal, max gas target): output = target*signal/15
+local function decompose(u)
   u = clamp(u, 0, MAX_OUT)
   local step = MAX_OUT / 15
   local signal = clamp(math.ceil(u / step - 1e-9), 0, 15)
   local target = MIN_OUT
   if signal > 0 then target = clamp(math.floor(u * 15 / signal + 0.5), MIN_OUT, MAX_OUT) end
+  return signal, target
+end
+
+local function applyOutput(u)
+  local signal, target = decompose(u)
   for _, s in ipairs(RS_SIDES) do redstone.setAnalogOutput(s, signal) end
   for _, b in ipairs(burners) do pcall(b.p.setTargetAmount, target) end
   return signal, target
 end
 
--- altitude provider: prefer the Avionics altitude_sensor; else fall back to the radio-GPS.
-local function makeAltSource()
-  local sensor = peripheral.find("altitude_sensor")
-  if sensor then
-    return {
-      kind = "altitude_sensor",
-      y  = function() local ok, v = pcall(sensor.getHeight); return ok and v or nil end,
-      vs = function() local ok, v = pcall(sensor.getVerticalSpeed); return ok and v or nil end,
-    }
-  end
-  local ok, gps2 = pcall(require, "gps2")
-  if not ok then return nil, "no altitude_sensor and gps2 lib unavailable" end
-  local okc, comms = pcall(require, "comms")
-  if okc then pcall(comms.open, { freq = RADIO_FREQ }) end
-  return {
-    kind = "gps(estimate)",
-    y  = function() local fix = gps2.locate(GPS_FIX_TIME, GPS_PINGS); return fix and fix.y or nil end,
-    vs = function() return nil end,   -- GPS gives no vspeed; derived from successive Y in the loop
-  }
-end
-
 local function altitude(argY)
-  local src, serr = makeAltSource()
-  if not src then
-    print("altitude hold needs an altitude_sensor or the radio-GPS: " .. tostring(serr))
+  local sensor = peripheral.find("altitude_sensor")
+  local gps2, gpsReady
+  do
+    local ok, lib = pcall(require, "gps2")
+    if ok then
+      gps2 = lib
+      local okc, comms = pcall(require, "comms")
+      if okc then pcall(comms.open, { freq = RADIO_FREQ }) end
+      gpsReady = true
+    end
+  end
+  if not sensor and not gpsReady then
+    print("altitude hold needs an altitude_sensor or the radio-GPS (gps2) - neither available.")
     return
   end
-  print("altitude source: " .. src.kind)
-  if src.kind ~= "altitude_sensor" then
-    print("WARNING: GPS Y is a coarse estimate (towers near-coplanar, ~6m off).")
+
+  local mon = peripheral.find("monitor")
+  if mon then pcall(mon.setTextScale, MON_SCALE) end
+
+  local gx, gy, gz, lastGpsAt = nil, nil, nil, -1e9
+  local prevGY, prevGT = nil, nil
+
+  -- one nav sample: {x,y,z,vspeed,ysrc}. sensor drives Y/vspeed when present (fast); GPS gives
+  -- X/Z (refreshed every GPS_REFRESH) and is the Y source when there is no sensor.
+  local function sample(now)
+    local x, y, z, vs, ysrc
+    if sensor then
+      local ok1, hy = pcall(sensor.getHeight);        if ok1 then y = hy end
+      local ok2, sv = pcall(sensor.getVerticalSpeed); if ok2 then vs = sv end
+      ysrc = "sensor"
+      if gpsReady and (now - lastGpsAt) >= GPS_REFRESH then
+        local fix = gps2.locate(GPS_FIX_TIME, GPS_PINGS)
+        if fix then gx, gy, gz, lastGpsAt = fix.x, fix.y, fix.z, now end
+      end
+      x, z = gx, gz
+    elseif gpsReady then
+      local fix = gps2.locate(GPS_FIX_TIME, GPS_PINGS)
+      if fix then
+        x, y, z = fix.x, fix.y, fix.z
+        ysrc = "gps"
+        if prevGY ~= nil and now > prevGT then vs = (y - prevGY) / (now - prevGT) else vs = 0 end
+        prevGY, prevGT = y, now
+      end
+    end
+    return { x = x, y = y, z = z, vspeed = vs, ysrc = ysrc }
   end
 
-  local targetY = tonumber(argY) or src.y()
+  local targetY = tonumber(argY) or sample(os.clock()).y
   if not targetY then print("could not read current altitude - aborting"); return end
   targetY = math.floor(targetY + 0.5)
 
-  print(("altitude hold engaging - target Y %d  (redstone on %s)")
-    :format(targetY, table.concat(RS_SIDES, "+")))
-  local integ = 0
-  local uPrev = 0
-  local prevY, prevT = nil, nil
+  -- compact wide layout (suits a short 1x3 monitor): 5 short rows, buttons on the last
+  local buttons = {}
+  local function render(st, u, sig, tgt, err, holding)
+    buttons = {}
+    local dev = mon or term
+    if mon then mon.setBackgroundColor(colors.black); mon.setTextColor(colors.white); mon.clear()
+    else term.clear(); term.setCursorPos(1, 1) end
+    local line = 1
+    local function put(s) dev.setCursorPos(1, line); dev.write(s); line = line + 1 end
+    put(("ALT [%s] X %s Y %s Z %s"):format(st.ysrc or "no fix", fmt(st.x), fmt(st.y), fmt(st.z)))
+    put(("tgt %d  vs %s  err %+.1f%s"):format(targetY,
+      st.vspeed and string.format("%+.2f", st.vspeed) or "-", err, holding and " HOLD" or ""))
+    put(("out %s sig %d/15 gas %d"):format(fmt(u), sig, tgt))
+    put(("lift %s fill %s/%s"):format(fmt(callm(rep.p, "getBalloonLift")),
+      fmt(callm(rep.p, "getBalloonFilledVolume")), fmt(callm(rep.p, "getBalloonTargetVolume"))))
+    local bx = 1
+    local function btn(label, d)
+      dev.setCursorPos(bx, line); dev.write(label)
+      if mon then buttons[#buttons + 1] = { x1 = bx, x2 = bx + #label - 1, y = line, d = d } end
+      bx = bx + #label + 1
+    end
+    btn("[-10]", -10); btn("[-1]", -1); btn("[+1]", 1); btn("[+10]", 10)
+    if not mon then dev.write(" +/- keys") end
+    line = line + 1
+    put("q quits")
+  end
+
+  print("altitude source: " .. (sensor and "altitude_sensor" or "gps(estimate)") ..
+        (mon and " | monitor dashboard on" or ""))
+  local integ, uPrev, lastTick = 0, 0, nil
   local timer = os.startTimer(CONTROL_DT)
   while true do
-    local ev, p = os.pullEvent()
-    if ev == "timer" and p == timer then
+    local ev = { os.pullEvent() }
+    local e = ev[1]
+    if e == "timer" and ev[2] == timer then
       local now = os.clock()
-      local cy = src.y()
-      term.clear(); term.setCursorPos(1, 1)
-      print("altitude hold  (" .. src.kind .. ", up/down or +/- nudge target Y, q to quit)")
-      if cy then
-        local dt = (prevT and (now - prevT)) or CONTROL_DT
-        if dt <= 0 then dt = CONTROL_DT end
-        local speed = src.vs()
-        if not speed then speed = (prevY ~= nil) and ((cy - prevY) / dt) or 0 end
-        local err = targetY - cy
-        integ = clamp(integ + err * KI * dt, 0, MAX_OUT)
-        local uRaw = clamp(KP * err - KD * speed + integ, 0, MAX_OUT)
-        local u = uPrev + OUT_SMOOTH * (uRaw - uPrev)
+      local dt = (lastTick and (now - lastTick)) or CONTROL_DT
+      if dt <= 0 then dt = CONTROL_DT end
+      lastTick = now
+      local st = sample(now)
+      local u, sig, tgt, err, holding = uPrev, 0, MIN_OUT, 0, true
+      if st.y then
+        holding = false
+        local speed = st.vspeed or 0
+        err = targetY - st.y
+        local predErr = targetY - (st.y + speed * LOOKAHEAD)
+        if math.abs(err) <= I_BAND and math.abs(speed) <= I_VMAX then
+          integ = clamp(integ + err * KI * dt, 0, MAX_OUT)
+        end
+        local uRaw = clamp(integ + KP * predErr, 0, MAX_OUT)
+        u = uPrev + OUT_SMOOTH * (uRaw - uPrev)
         uPrev = u
-        local sig, tgt = applyOutput(u)
-        print(("target Y %d | now %s | err %+.1f | vspeed %+.2f")
-          :format(targetY, fmt(cy), err, speed))
-        print(("output %.0f -> signal %d/15, max gas %d  (burner reads %s)")
-          :format(u, sig, tgt, fmt(callm(rep.p, "getSignalStrength"))))
-        print(("balloon lift %s | fill %s / %s")
-          :format(fmt(callm(rep.p, "getBalloonLift")), fmt(callm(rep.p, "getBalloonFilledVolume")),
-                  fmt(callm(rep.p, "getBalloonTargetVolume"))))
-        prevY, prevT = cy, now
+        sig, tgt = applyOutput(u)
       else
-        print("no altitude reading this tick - holding actuators")
+        sig, tgt = decompose(uPrev)
       end
+      render(st, u, sig, tgt, err, holding)
       timer = os.startTimer(CONTROL_DT)
-    elseif ev == "key" then
-      if p == keys.up then targetY = targetY + Y_STEP
-      elseif p == keys.down then targetY = targetY - Y_STEP
-      elseif p == keys.q then break end
-    elseif ev == "char" then
-      if p == "+" or p == "=" then targetY = targetY + Y_STEP
-      elseif p == "-" or p == "_" then targetY = targetY - Y_STEP
-      elseif p == "q" then break end
+    elseif e == "key" then
+      if ev[2] == keys.up then targetY = targetY + Y_STEP
+      elseif ev[2] == keys.down then targetY = targetY - Y_STEP
+      elseif ev[2] == keys.q then break end
+    elseif e == "char" then
+      if ev[2] == "+" or ev[2] == "=" then targetY = targetY + Y_STEP
+      elseif ev[2] == "-" or ev[2] == "_" then targetY = targetY - Y_STEP
+      elseif ev[2] == "q" then break end
+    elseif e == "monitor_touch" then
+      local tx, ty = ev[3], ev[4]
+      for _, b in ipairs(buttons) do
+        if ty == b.y and tx >= b.x1 and tx <= b.x2 then targetY = targetY + b.d; break end
+      end
     end
   end
   for _, s in ipairs(RS_SIDES) do redstone.setAnalogOutput(s, 0) end
+  if mon then pcall(mon.clear) end
   print("altitude hold stopped - redstone cut to 0 (burners idle).")
 end
 
