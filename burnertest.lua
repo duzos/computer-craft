@@ -12,7 +12,7 @@
 --   output (setTargetAmount); burner output = target*signal/15, split coarse(signal)/fine(target).
 --   Control = HOVER feed-forward + predictive P (steers on cy + vspeed*LOOKAHEAD so it eases off
 --   EARLY for the laggy balloon) + an anti-windup integral that learns the true hover throttle, so
---   at the setpoint it holds power instead of cutting out and dropping. OUT_SMOOTH slews the output.
+--   at the setpoint it holds power instead of cutting out and dropping. SMOOTH_TAU slews the output.
 --   Altitude/vspeed: Avionics altitude_sensor if present, else the radio-GPS (gps2, coarse Y).
 --   The radio-GPS is polled CONTINUOUSLY in the background for live X/Z (and Y when no sensor).
 --   With an advanced MONITOR attached it shows a colour dashboard (gauges, XYZ, vspeed, balloon)
@@ -26,12 +26,14 @@ local RADIO_FREQ = 1000                 -- fleet radio freq, used for the GPS al
 local MAX_OUT    = 500   -- ceiling for max gas output (lower it if your burners cap below 500)
 local MIN_OUT    = 5     -- burner's minimum settable target
 local HOVER      = 120   -- baseline throttle that roughly holds level (the integral trims around it)
-local KP, KI     = 5, 1.5  -- predictive proportional gain; integral (hover-trim) gain
+local KP, KI     = 3, 1.0  -- predictive proportional gain; integral (hover-trim) gain
 local LOOKAHEAD  = 5.0   -- s of prediction; RAISE to match balloon fill lag if it overshoots
-local OUT_SMOOTH = 0.3   -- 0..1 output slew per tick (lower = gentler, more lag)
-local CONTROL_DT = 0.2   -- seconds between control ticks
-local GPS_FIX_TIME = 1.0 -- GPS: seconds per background fix
-local GPS_PINGS    = 4   -- GPS: pings gathered per fix
+local SMOOTH_TAU = 2.0   -- output slew time-constant in s (HIGHER = softer ease in/out; tick-rate independent)
+local CONTROL_DT = 0.1   -- seconds between control ticks (lower = Y/readout updates faster)
+local GPS_FIX_TIME = 1.0 -- GPS: seconds for the initial one-shot fix (sets the default target)
+local GPS_PINGS    = 4   -- GPS: pings for that initial fix
+local GPS_PING_EVERY = 0.15  -- background poller: constant ping interval in s (lower = more constant)
+local GPS_AVG        = 1.2   -- background poller: rolling distance-average + vspeed window (s)
 local MON_SCALE  = 0.5   -- monitor text scale (0.5 suits a 2x3; raise for bigger monitors)
 local Y_STEP     = 1     -- target-altitude nudge per key press
 
@@ -166,14 +168,13 @@ end
 
 local function altitude(argY)
   local sensor = peripheral.find("altitude_sensor")
-  local gps2, gpsReady
+  local gps2, comms, gpsReady
   do
     local ok, lib = pcall(require, "gps2")
     if ok then
       gps2 = lib
-      local okc, comms = pcall(require, "comms")
-      if okc then pcall(comms.open, { freq = RADIO_FREQ }) end
-      gpsReady = true
+      local okc, c = pcall(require, "comms")
+      if okc then comms = c; pcall(comms.open, { freq = RADIO_FREQ }); gpsReady = true end
     end
   end
   if not sensor and not gpsReady then
@@ -186,15 +187,44 @@ local function altitude(argY)
 
   -- shared position, updated continuously by the background GPS poller
   local gx, gy, gz, gVspeed, gpsAt = nil, nil, nil, nil, nil
+  -- streaming poller: pings at a fixed interval forever, re-solves on every tower response from a
+  -- rolling per-tower distance average; vspeed over a short baseline (raw GPS Y is too noisy tick-to-tick).
   local function gpsLoop()
-    local pY, pT
+    local towers, yhist, lastPing = {}, {}, -1e9
     while true do
-      local fix = gps2.locate(GPS_FIX_TIME, GPS_PINGS)
-      if fix then
-        local now = os.clock()
-        gx, gz = fix.x, fix.z
-        if pY ~= nil and now > pT then gVspeed = (fix.y - pY) / (now - pT) end
-        gy, pY, pT, gpsAt = fix.y, fix.y, now, now
+      local now = os.clock()
+      if now - lastPing >= GPS_PING_EVERY then
+        comms.send("all", { type = "gpsq" }, "gps")
+        lastPing = now
+      end
+      local m = comms.receive("gps", GPS_PING_EVERY)
+      now = os.clock()
+      if m and m.dist and type(m.body) == "table" and m.body.type == "gpsr"
+         and type(m.body.pos) == "table" then
+        local t = towers[m.from]
+        if not t then t = { pos = m.body.pos, samples = {} }; towers[m.from] = t end
+        t.pos = m.body.pos
+        t.samples[#t.samples + 1] = { d = m.dist, t = now }
+      end
+      local pts = {}
+      for _, t in pairs(towers) do
+        local sum, n, keep = 0, 0, {}
+        for _, smp in ipairs(t.samples) do
+          if now - smp.t <= GPS_AVG then keep[#keep + 1] = smp; sum = sum + smp.d; n = n + 1 end
+        end
+        t.samples = keep
+        if n > 0 then pts[#pts + 1] = { x = t.pos.x, y = t.pos.y, z = t.pos.z, d = sum / n } end
+      end
+      if #pts >= 4 then
+        local fix = gps2.trilaterate(pts)
+        if fix then
+          gx, gy, gz, gpsAt = fix.x, fix.y, fix.z, now
+          yhist[#yhist + 1] = { t = now, y = fix.y }
+          while #yhist > 1 and now - yhist[1].t > GPS_AVG do table.remove(yhist, 1) end
+          if #yhist >= 2 and now > yhist[1].t then
+            gVspeed = (fix.y - yhist[1].y) / (now - yhist[1].t)
+          end
+        end
       end
     end
   end
@@ -206,7 +236,8 @@ local function altitude(argY)
       local ok2, sv = pcall(sensor.getVerticalSpeed); if ok2 then vs = sv end
       ysrc = "sensor"
     elseif gy then
-      y, vs, ysrc = gy, gVspeed or 0, "gps"
+      local age = gpsAt and (os.clock() - gpsAt) or 0
+      y, vs, ysrc = gy + (gVspeed or 0) * age, gVspeed or 0, "gps"   -- extrapolate between fixes
     end
     return { x = x, y = y, z = z, vspeed = vs, ysrc = ysrc }
   end
@@ -313,7 +344,7 @@ local function altitude(argY)
             integ = clamp(integ + err * KI * dt, -MAX_OUT, MAX_OUT)
           end
           uRaw = clamp(HOVER + KP * predErr + integ, 0, MAX_OUT)
-          u = uPrev + OUT_SMOOTH * (uRaw - uPrev)
+          u = uPrev + clamp(dt / SMOOTH_TAU, 0, 1) * (uRaw - uPrev)
           uPrev = u
           sig, tgt = applyOutput(u)
         else
