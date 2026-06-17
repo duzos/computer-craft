@@ -282,7 +282,8 @@ local function overviewRender()
     if cur.kind == "tree" then
       at(1, H - 4, clip(("%s  logs %d"):format(cur.phase or "?", cur.logs or 0), W - 7), colors.lightGray)
     elseif cur.kind == "craft" then
-      at(1, H - 4, clip(("%s  crafter"):format(cur.phase or "idle"), W - 7), colors.lightGray)
+      local d = (cur.pct or 0) > 0 and ("%s  eta %s"):format(cur.phase or "?", fmtEta(cur.eta)) or (cur.phase or "idle")
+      at(1, H - 4, clip(d, W - 7), colors.lightGray)
     else
       at(1, H - 4, clip(("%s eta %s y%d"):format(cur.phase or "?", fmtEta(cur.eta), cur.pos and cur.pos.y or 0), W - 7), colors.lightGray)
     end

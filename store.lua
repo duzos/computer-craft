@@ -1443,7 +1443,8 @@ local function drawQuarry(mon)
     else statusCol, statusTxt = (ago < 15 and colors.lime or colors.lightGray), fmtAgo(ago) end
 
     local tree = tr.kind == "tree"
-    local noPct = tree or tr.kind == "craft"         -- trees + crafters have no mining %
+    local craft = tr.kind == "craft"
+    local noPct = tree or (craft and (tr.pct or 0) == 0)   -- show % for a crafter only while it's crafting
     local nm = tr.label or ("t" .. tr.id)
     txt(1, row, nm, colors.white, rbg)
     txt(w - #statusTxt + 1, row, statusTxt, statusCol, rbg)
@@ -1471,7 +1472,9 @@ local function drawQuarry(mon)
       if tree then                                   -- last harvest stats instead of fuel/eta
         local cut = tr.lastMine and fmtAgo(now - tr.lastMine) or "-"
         txt(dx, row, ("logs %d   cut %s"):format(tr.logs or 0, cut), colors.lightGray, rbg)
-      elseif tr.kind ~= "craft" then                 -- crafters show only their phase (above)
+      elseif craft then                              -- while crafting: phase (the target item) + time left
+        if (tr.pct or 0) > 0 then txt(dx, row, "eta " .. fmtEta(tr.eta), colors.lightGray, rbg) end
+      else
         local last = tr.last and (tr.last:match("[^:]+$") or tr.last) or "-"
         local ffrac = (tr.fuelMax and tr.fuelMax > 0) and (tr.fuel or 0) / tr.fuelMax or 0
         local fcol = ffrac > 0.5 and colors.lime or (ffrac > 0.2 and colors.orange or colors.red)

@@ -23,6 +23,7 @@ local comms = require("comms")
 local STORE_PROTOCOL = "store"
 local STORE_NAME     = "store"
 local RADIO_FREQ     = 1000        -- must match the store's RADIO_FREQ
+local TELEM_INTERVAL = 2           -- seconds between progress telemetry pings while crafting
 local CFG_FILE       = "crafter.cfg"
 
 -- store-side wired names of the two chests, asked on first boot. the turtle sucks/drops by
@@ -54,16 +55,18 @@ local function request(cmd)
   return m and m.body
 end
 
-local function checkin(phase)
+-- send telemetry; `phase` is what we're doing (the target item while crafting), `pct` the overall
+-- progress, `wait` how long to listen for a reply (short while crafting, default at idle). the store
+-- derives "time remaining" from the pct climbing over successive pings.
+local function checkin(phase, pct, wait)
   if not comms.up() then return nil end
-  local fl = turtle.getFuelLevel()
   comms.send(STORE_NAME, {
     type = "telem", kind = "craft", id = os.getComputerID(), label = os.getComputerLabel(),
-    phase = phase or "idle", pct = 0, halted = false,
-    fuel = (fl == "unlimited") and 1 or fl, fuelMax = 1,
+    phase = phase or "idle", pct = pct or 0, halted = false,
+    fuel = 1, fuelMax = 1,
     craftIn = CRAFT_IN,            -- so the store learns where to deliver raws
   }, STORE_PROTOCOL)
-  local m = comms.receive(STORE_PROTOCOL, 1.5)
+  local m = comms.receive(STORE_PROTOCOL, wait or 1.5)
   local body = m and m.body
   rebootIfAsked(body)
   return body
@@ -169,26 +172,32 @@ local function craftOne(grid)
   return true
 end
 
--- run one recipe step; returns ok, reason: "bad recipe (relearn)", "need <item>", "inv full",
--- "no crafting table".
-local function runStep(step)
-  for done = 1, step.batches do
-    local ok, why = craftOne(step.grid)
-    if not ok then return false, why end
-    if step.batches > 8 and done % 8 == 0 then print(("    %d/%d"):format(done, step.batches)) end
-  end
-  return true
-end
-
+-- runs the plan; reports live progress to the store (phase = target item, pct = batches done out of
+-- total) so the Overview/pocket can show the current craft + a derived time-remaining. returns ok, made, err
 local function execute(steps)
   dumpAll()                                           -- clean the turtle (materials live in craftIn)
   local target = steps[#steps] and steps[#steps].out
+  local total = 0
+  for _, s in ipairs(steps) do total = total + s.batches end
+  local done, lastPing = 0, 0
+  local function ping(force)                          -- time-gated progress telem (drains the reply / honors reboot)
+    if not comms.up() then return end
+    if not force and os.clock() - lastPing < TELEM_INTERVAL then return end
+    lastPing = os.clock()
+    checkin(shortId(target), total > 0 and math.floor(done / total * 100) or 0, 0.2)
+  end
   print(("crafting %s  (%d step%s)"):format(shortId(target), #steps, #steps == 1 and "" or "s"))
+  ping(true)
   local err
   for i, step in ipairs(steps) do
     print(("  [%d/%d] %d x %s"):format(i, #steps, step.batches * step.yield, shortId(step.out)))
-    local ok, why = runStep(step)
-    if not ok then err = shortId(step.out) .. ": " .. (why or "failed"); break end
+    for _ = 1, step.batches do
+      local ok, why = craftOne(step.grid)
+      if not ok then err = shortId(step.out) .. ": " .. (why or "failed"); break end
+      done = done + 1
+      ping(false)
+    end
+    if err then break end
   end
   while turtle.suck() do end                          -- collect the buffer from craftIn...
   local made = target and countId(target) or 0
@@ -260,7 +269,6 @@ local function main()
   while true do
     local cmd = checkin("idle")
     if type(cmd) == "table" and cmd.type == "craftplan" then
-      checkin("crafting")
       local ok, made, err = execute(cmd.steps or {})
       comms.send(STORE_NAME, { type = "craftdone", id = os.getComputerID(), ok = ok, made = made, err = err }, STORE_PROTOCOL)
       comms.receive(STORE_PROTOCOL, 2)                -- wait for the store's ack
