@@ -125,10 +125,10 @@ local touchRegions = {}      -- monitor name -> { kind, rows/items, buttons = {{
 local monSel = {}            -- monitor name -> selected turtle id (turtles page)
 local monStore = {}          -- monitor name -> { sel, scroll, amt, dest, sortMode, list, rows, maxScroll }
 local STORE_AMOUNTS = { 1, 8, 16, 32, 64 }
-local STORE_SORTS = {
+local STORE_SORTS = {                  -- index 1 is the default; a-z first
+  { key = "a-z", cmp = function(a, b) return (a.id:match("[^:]+$") or a.id) < (b.id:match("[^:]+$") or b.id) end },
   { key = "qty", cmp = function(a, b) return a.n > b.n end },
   { key = "low", cmp = function(a, b) return a.n < b.n end },
-  { key = "a-z", cmp = function(a, b) return (a.id:match("[^:]+$") or a.id) < (b.id:match("[^:]+$") or b.id) end },
 }
 local function storeState(name)
   local s = monStore[name]

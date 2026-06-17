@@ -67,10 +67,10 @@ local ROWS = LIST_BOTTOM - LIST_TOP + 1
 local amtRegions, getBtn, procBtn, sortBtn, sortTagBtn = {}, nil, nil, nil, nil
 local procBtns, cancelBtn = {}, nil   -- type buttons shown while picking; cancel
 
-local SORTS = {
+local SORTS = {                        -- index 1 is the default; a-z first
+  { key = "a-z", cmp = function(a, b) return short(a.id) < short(b.id) end },
   { key = "qty", cmp = function(a, b) return a.n > b.n end },
   { key = "low", cmp = function(a, b) return a.n < b.n end },
-  { key = "a-z", cmp = function(a, b) return short(a.id) < short(b.id) end },
 }
 local function applySort() table.sort(items, SORTS[sortMode].cmp) end
 local function reselect(id) if id then for i, it in ipairs(items) do if it.id == id then sel = i; return end end end end
