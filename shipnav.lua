@@ -199,14 +199,21 @@ local function altStep(targetY, st, dt, now)
   if not st.y or #burners == 0 then local s, t = applyBurner(alt.uPrev); return alt.uPrev, s, t, 0, 0 end
   local speed = st.vspeed or 0
   local err = targetY - st.y
-  local desiredV = clamp(K_ALT * (targetY - (st.y + speed * alt.leadEst)), -V_DN, V_UP)
+  -- ADAPTIVE: cap approach speed so it can be arrested within the learned lag (slows down in time,
+  -- no overshoot) yet stays fast far away; predict ahead by the lag so it eases off early.
+  local vCap = math.abs(err) / math.max(alt.leadEst, 2)
+  local desiredV = clamp(K_ALT * (targetY - (st.y + speed * alt.leadEst)),
+                         -math.min(V_DN, vCap), math.min(V_UP, vCap))
   local vErr = desiredV - speed
+  -- hover integral adapts ONLY near steady state, so a climb/descent can't wind it up (was the overshoot)
   local uUnsat = alt.integ + KP_V * vErr
-  if (uUnsat > 0 and uUnsat < MAX_OUT) or (uUnsat <= 0 and vErr > 0) or (uUnsat >= MAX_OUT and vErr < 0) then
+  if math.abs(vErr) < 0.6 and uUnsat > 0 and uUnsat < MAX_OUT then
     alt.integ = clamp(alt.integ + KI_V * vErr * dt, 0, MAX_OUT)
   end
+  -- ADAPTIVE band: up-band shrinks toward the target (no overfill+overshoot); down-band kept open (braking)
+  local bandFrac = clamp(math.abs(err) / 25, 0.15, 1.0)
   local lo = math.max(0, alt.integ - math.max(DOWN_MARGIN, 0.45 * alt.integ))
-  local hi = math.min(MAX_OUT, alt.integ + math.max(UP_MARGIN, 0.40 * alt.integ))
+  local hi = math.min(MAX_OUT, alt.integ + math.max(UP_MARGIN, 0.40 * alt.integ) * bandFrac)
   local u = alt.uPrev + clamp(dt / SMOOTH_TAU, 0, 1) * (clamp(alt.integ + KP_V * vErr, lo, hi) - alt.uPrev)
   alt.uPrev = u
   local sig, tgt = applyBurner(u)
