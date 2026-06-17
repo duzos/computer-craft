@@ -33,7 +33,7 @@ local CONTROL_DT = 0.1   -- seconds between control ticks (lower = Y/readout upd
 local GPS_FIX_TIME = 1.0 -- GPS: seconds for the initial one-shot fix (sets the default target)
 local GPS_PINGS    = 4   -- GPS: pings for that initial fix
 local GPS_PING_EVERY = 0.15  -- background poller: constant ping interval in s (lower = more constant)
-local GPS_AVG        = 1.2   -- background poller: rolling distance-average + vspeed window (s)
+local GPS_AVG        = 1.2   -- background poller: tower staleness + vspeed baseline window (s)
 local MON_SCALE  = 0.5   -- monitor text scale (0.5 suits a 2x3; raise for bigger monitors)
 local Y_STEP     = 1     -- target-altitude nudge per key press
 
@@ -187,8 +187,8 @@ local function altitude(argY)
 
   -- shared position, updated continuously by the background GPS poller
   local gx, gy, gz, gVspeed, gpsAt = nil, nil, nil, nil, nil
-  -- streaming poller: pings at a fixed interval forever, re-solves on every tower response from a
-  -- rolling per-tower distance average; vspeed over a short baseline (raw GPS Y is too noisy tick-to-tick).
+  -- streaming poller: pings at a fixed interval forever, re-solves on every tower response using each
+  -- tower's LATEST distance (no averaging); vspeed over a short baseline since GPS Y is noisy.
   local function gpsLoop()
     local towers, yhist, lastPing = {}, {}, -1e9
     while true do
@@ -202,18 +202,15 @@ local function altitude(argY)
       if m and m.dist and type(m.body) == "table" and m.body.type == "gpsr"
          and type(m.body.pos) == "table" then
         local t = towers[m.from]
-        if not t then t = { pos = m.body.pos, samples = {} }; towers[m.from] = t end
+        if not t then t = {}; towers[m.from] = t end
         t.pos = m.body.pos
-        t.samples[#t.samples + 1] = { d = m.dist, t = now }
+        t.d, t.t = m.dist, now
       end
       local pts = {}
       for _, t in pairs(towers) do
-        local sum, n, keep = 0, 0, {}
-        for _, smp in ipairs(t.samples) do
-          if now - smp.t <= GPS_AVG then keep[#keep + 1] = smp; sum = sum + smp.d; n = n + 1 end
+        if t.t and (now - t.t) <= GPS_AVG then
+          pts[#pts + 1] = { x = t.pos.x, y = t.pos.y, z = t.pos.z, d = t.d }
         end
-        t.samples = keep
-        if n > 0 then pts[#pts + 1] = { x = t.pos.x, y = t.pos.y, z = t.pos.z, d = sum / n } end
       end
       if #pts >= 4 then
         local fix = gps2.trilaterate(pts)
