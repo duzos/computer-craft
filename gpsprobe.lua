@@ -2,7 +2,8 @@
 -- pings the LIVE gpshost towers (no tower changes, no responder peer -- they reply
 -- on the "gps" proto).
 --   run:  gpsprobe          interactive GUI (below)
---         gpsprobe list      one-shot text dump of each tower's pos + stats, then exit
+--         gpsprobe list      one-shot text dump of each tower's pos + stats to the
+--                            screen AND gpsprobe.txt (latest run), then exit
 -- Two views in the GUI, toggle with m:
 --   TABLE  per tower: measured distance, jitter, and -- if you've entered your F3
 --          position -- the error vs true distance, plus the trilaterated fix/error.
@@ -26,6 +27,7 @@ local REDRAW     = 0.3     -- seconds between redraws
 local MAXS       = 16      -- distance samples kept per tower
 local STALE      = 4       -- tower dropped from the view if unheard this long
 local LIST_SECS  = 2.5     -- "gpsprobe list" gather window
+local LIST_FILE  = "gpsprobe.txt"  -- "gpsprobe list" also writes the latest dump here
 
 local args = { ... }
 local listMode = (args[1] == "list")
@@ -282,22 +284,30 @@ local function runList()
     if os.clock() >= nextPing then ping(); nextPing = os.clock() + PING_EVERY end
   end
   local towers, _, fix, kind = compute()
-  print(("gps towers heard: %d"):format(#towers))
-  if #towers == 0 then
-    print("  none -- towers down or out of radio range")
-    return
-  end
-  print("id      x     y     z     dist  jit  n")
-  for _, t in ipairs(towers) do
-    print(("#%-4d %5d %5d %5d %6.1f %4.1f %2d"):format(
-      t.id, t.pos.x, t.pos.y, t.pos.z, t.val, t.spread, #hosts[t.id].ds))
-  end
-  if kind == "3D" and fix then
-    print(("fix: %.1f %.1f %.1f (3D)"):format(fix.x, fix.y, fix.z))
-  elseif kind == "2D" and fix then
-    print(("fix: %.1f ?  %.1f (2D x/z, need 4 for 3D)"):format(fix.x, fix.z))
+  local lines = {}
+  local function emit(s) lines[#lines + 1] = s; print(s) end   -- to screen and file
+  emit(("gps towers heard: %d"):format(#towers))
+  if #towers > 0 then
+    emit("id      x     y     z     dist  jit  n")
+    for _, t in ipairs(towers) do
+      emit(("#%-4d %5d %5d %5d %6.1f %4.1f %2d"):format(
+        t.id, t.pos.x, t.pos.y, t.pos.z, t.val, t.spread, #hosts[t.id].ds))
+    end
+    if kind == "3D" and fix then
+      emit(("fix: %.1f %.1f %.1f (3D)"):format(fix.x, fix.y, fix.z))
+    elseif kind == "2D" and fix then
+      emit(("fix: %.1f ?  %.1f (2D x/z, need 4 for 3D)"):format(fix.x, fix.z))
+    else
+      emit(("no fix: need 4 towers, have %d"):format(#towers))
+    end
   else
-    print(("no fix: need 4 towers, have %d"):format(#towers))
+    emit("  none -- towers down or out of radio range")
+  end
+  local f = fs.open(LIST_FILE, "w")
+  if f then
+    f.write(table.concat(lines, "\n") .. "\n")
+    f.close()
+    print("-> " .. LIST_FILE)
   end
 end
 
