@@ -10,10 +10,10 @@
 -- ALTITUDE HOLD ("burnertest altitude [Y]"):
 --   holds a world-Y by driving BOTH the redstone signal (0-15, on RS_SIDES) and the max gas
 --   output (setTargetAmount); burner output = target*signal/15, split coarse(signal)/fine(target).
---   Control is CASCADE: altitude error -> a commanded climb rate (capped at V_MAX), then a vspeed
---   loop whose integral CONVERGES TO the balancing throttle (hover point) on its own - so it stops
---   pinning 100% until arrival, climbs at a set rate, and eases to hover. LEAD predicts ahead by the
---   throttle->response lag so it levels off early; SMOOTH_TAU slews the output.
+--   Control is CASCADE: altitude error -> a commanded climb rate (climb<=V_UP, descent<=V_DN since a
+--   balloon only cools passively), then a vspeed loop whose slow integral TRACKS the balancing throttle
+--   (hover) on its own. Throttle is floored at balance-DOWN_MARGIN so a level-off can't kill power and
+--   make it plummet on the response lag. LEAD predicts ahead by that lag; SMOOTH_TAU slews the output.
 --   Altitude/vspeed: Avionics altitude_sensor if present, else the radio-GPS (gps2, coarse Y).
 --   The radio-GPS is polled CONTINUOUSLY in the background for live X/Z (and Y when no sensor).
 --   With an advanced MONITOR attached it shows a colour dashboard (gauges, XYZ, vspeed, balloon)
@@ -27,9 +27,11 @@ local RADIO_FREQ = 1000                 -- fleet radio freq, used for the GPS al
 local MAX_OUT    = 500   -- ceiling for max gas output (lower it if your burners cap below 500)
 local MIN_OUT    = 5     -- burner's minimum settable target
 local HOVER0     = 120   -- initial guess for the balancing throttle; the controller refines it live
-local V_MAX      = 2.0   -- max climb/descend rate the controller commands (m/s)
+local V_UP       = 1.5   -- max commanded CLIMB rate (m/s)
+local V_DN       = 0.5   -- max commanded DESCENT rate (m/s) - small; a balloon only cools passively
 local K_ALT      = 0.5   -- altitude error -> commanded vspeed (per block); lower = gentler approach
-local KP_V, KI_V = 20, 12  -- vspeed->throttle gains; the integral CONVERGES TO the balancing throttle
+local KP_V, KI_V = 12, 5   -- vspeed->throttle gains; the SLOW integral tracks the balancing throttle
+local DOWN_MARGIN = 100  -- throttle is never pulled more than this BELOW the balancing point (stops kill+plummet)
 local LEAD       = 3.0   -- s; prediction lead = the throttle->response lag, so it levels off early
 local SMOOTH_TAU = 1.5   -- output slew time-constant in s (HIGHER = softer)
 local CONTROL_DT = 0.1   -- seconds between control ticks (lower = Y/readout updates faster)
@@ -337,15 +339,16 @@ local function altitude(argY)
           local speed = st.vspeed or 0
           err = targetY - st.y
           local predY = st.y + speed * LEAD                       -- account for the response lag
-          desiredV = clamp(K_ALT * (targetY - predY), -V_MAX, V_MAX)
+          desiredV = clamp(K_ALT * (targetY - predY), -V_DN, V_UP)
           local vErr = desiredV - speed
           local uUnsat = integ + KP_V * vErr
           if (uUnsat > 0 and uUnsat < MAX_OUT)
              or (uUnsat <= 0 and vErr > 0)
              or (uUnsat >= MAX_OUT and vErr < 0) then
-            integ = clamp(integ + KI_V * vErr * dt, 0, MAX_OUT)    -- converges to balancing throttle
+            integ = clamp(integ + KI_V * vErr * dt, 0, MAX_OUT)    -- slow tracker of the balancing throttle
           end
-          local uRaw = clamp(integ + KP_V * vErr, 0, MAX_OUT)
+          local lo = math.max(0, integ - DOWN_MARGIN)             -- floor: never kill far below hover
+          local uRaw = clamp(integ + KP_V * vErr, lo, MAX_OUT)
           u = uPrev + clamp(dt / SMOOTH_TAU, 0, 1) * (uRaw - uPrev)
           uPrev = u
           sig, tgt = applyOutput(u)
