@@ -18,8 +18,7 @@
 --   The radio-GPS is polled CONTINUOUSLY in the background for live X/Z (and Y when no sensor).
 --   With an advanced MONITOR attached it shows a colour dashboard (gauges, XYZ, vspeed, balloon)
 --   with touch -10/-1/+1/+10 target buttons; the computer up/down or +/- keys also nudge it, q quits.
---   HOVER and the gains are guesses - tune in game (HOVER = throttle that holds level; raise LOOKAHEAD
---   if it overshoots).
+--   The gains are guesses - tune in game. Every altitude run logs telemetry to LOG_FILE (CSV) for analysis.
 
 local RS_SIDES   = { "left", "right" }  -- sides the computer feeds redstone into the burners
 local RADIO_FREQ = 1000                 -- fleet radio freq, used for the GPS altitude/position source
@@ -41,6 +40,8 @@ local GPS_PING_EVERY = 0.15  -- background poller: constant ping interval in s (
 local GPS_AVG        = 1.2   -- background poller: tower staleness + vspeed baseline window (s)
 local MON_SCALE  = 0.5   -- monitor text scale (0.5 suits a 2x3; raise for bigger monitors)
 local Y_STEP     = 1     -- target-altitude nudge per key press
+local LOG_FILE   = "burnerlog.csv"  -- altitude-hold telemetry log (CSV); retrieve + share for tuning
+local LOG_DT     = 0.2   -- seconds between logged CSV rows
 
 local function findBurners()
   local list, seen = {}, {}
@@ -85,6 +86,12 @@ local function fmt(x)
 end
 
 local function clamp(x, lo, hi) return math.max(lo, math.min(hi, x)) end
+
+local function cv(x)   -- CSV cell: numbers to 3dp, nil to empty
+  if type(x) == "number" then return string.format("%.3f", x) end
+  if x == nil then return "" end
+  return tostring(x)
+end
 
 -- coloured drawing helpers (storepad style), on any term/monitor device
 local function at(dev, x, y, s, fg, bg)
@@ -256,6 +263,26 @@ local function altitude(argY)
   if not targetY then print("could not read current altitude - aborting"); return end
   targetY = math.floor(targetY + 0.5)
 
+  local logf = fs.open(LOG_FILE, "w")
+  if logf then
+    logf.writeLine("t,src,x,y,z,target,err,vspeed,wantv,u,sig,gas,bal,bsig,gasout,lift,fill,filltgt,dvol,cap,active")
+  end
+  local lastLog = nil
+  local function logRow(st, u, sig, tgt, err, desiredV, bal, now)
+    if not logf then return end
+    if lastLog and (now - lastLog) < LOG_DT then return end
+    lastLog = now
+    logf.writeLine(table.concat({
+      cv(now), st.ysrc or "", cv(st.x), cv(st.y), cv(st.z), cv(targetY), cv(err),
+      cv(st.vspeed), cv(desiredV), cv(u), cv(sig), cv(tgt), cv(bal),
+      cv(callm(rep.p, "getSignalStrength")), cv(callm(rep.p, "getGasOutput")),
+      cv(callm(rep.p, "getBalloonLift")), cv(callm(rep.p, "getBalloonFilledVolume")),
+      cv(callm(rep.p, "getBalloonTargetVolume")), cv(callm(rep.p, "getBalloonVolumeChange")),
+      cv(callm(rep.p, "getBalloonCapacity")), cv(callm(rep.p, "isActive")),
+    }, ","))
+    logf.flush()
+  end
+
   local buttons = {}
   local function render(st, u, sig, tgt, err, desiredV, hoverEst)
     local dev = mon or term
@@ -356,6 +383,7 @@ local function altitude(argY)
           sig, tgt = decompose(uPrev)
         end
         render(st, u, sig, tgt, err, desiredV, integ)
+        logRow(st, u, sig, tgt, err, desiredV, integ, now)
         timer = os.startTimer(CONTROL_DT)
       elseif e == "key" then
         if ev[2] == keys.up then targetY = targetY + Y_STEP
@@ -377,6 +405,7 @@ local function altitude(argY)
 
   for _, s in ipairs(RS_SIDES) do redstone.setAnalogOutput(s, 0) end
   if mon then pcall(mon.setBackgroundColor, colors.black); pcall(mon.clear) end
+  if logf then logf.close(); print("log written to /" .. LOG_FILE) end
   print("altitude hold stopped - redstone cut to 0 (burners idle).")
 end
 
