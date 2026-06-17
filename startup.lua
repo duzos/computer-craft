@@ -13,6 +13,7 @@
 --   crafter crafter.lua
 --   boiler  boilerkeeper.lua
 --   pad     storepad.lua
+--   ship    shipnav.lua                       (airship XYZ autopilot; prompts relays -> shipnav.cfg)
 --
 --   startup reset   re-ask the role (wipes device.cfg)
 --
@@ -33,6 +34,7 @@ local ROLES = {
   crafter = { run = "crafter.lua" },
   boiler = { run = "boilerkeeper.lua" },
   pad    = { run = "storepad.lua" },
+  ship   = { run = "shipnav.lua" },
 }
 
 local function empty(path)
