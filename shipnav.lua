@@ -10,8 +10,9 @@
 --   Thrust/drag are SELF-TUNING: it learns this ship's speed-per-thrust and coast (drag) time-constant
 --   live and decelerates to arrive without overshoot; persisted to shipnav.state (no hardcoded constants).
 -- SENSING: position from the radio-GPS (gps2). Altitude/vspeed from an Avionics altitude_sensor if
---   present, else GPS Y. Heading from an Avionics navigation_table if present, else GPS course-over-
---   ground (only valid while moving). GPS is the full fallback; Create peripherals are used when found.
+--   present, else GPS Y. Heading: navigation_table (absolute) if present; else a gimbal_sensor's yaw
+--   rate integrated and re-anchored to GPS course (valid even while slow/turning); else raw GPS course.
+--   A gimbal also damps the steering (yaw rate). GPS is the full fallback; Create peripherals used when found.
 -- UI (advanced monitor, else terminal): top-down map - TAP to set the X/Z target - with the ship
 --   (heading arrow), target, towers and a trail; target X/Y/Z + heading + distance readout; buttons to
 --   nudge Y and STOP. Keys: arrows / +/- nudge target Y, s = stop horizontal, q = quit.
@@ -43,7 +44,10 @@ local BURNER_SIDES = { "left", "right" } -- computer faces feeding the burners' 
 -- horizontal control
 local STEER_SIGN   = 1      -- flip to -1 if the wheel turns the wrong way
 local HEADING_OFFSET = 0    -- deg added to a nav_table heading to match the GPS x/z frame
-local TURN_GAIN    = 0.10   -- wheel signal per deg of heading error
+local GYRO_SIGN    = 1      -- gimbal yaw-rate polarity (flip if the fused heading spins the wrong way)
+local HDG_CORRECT  = 0.05   -- how strongly GPS course re-anchors the gimbal-integrated heading (0..1)
+local TURN_GAIN    = 0.30   -- wheel signal per deg of heading error
+local TURN_DAMP    = 0.30   -- steering yaw-rate damping (signal per deg/s); reduces turn overshoot
 local TURN_DEADBAND = 8     -- deg; inside this, stop steering
 local NAV_STATE    = "shipnav.state"  -- learned horizontal dynamics {thrustK, dragTau}, per ship
 local ARRIVE_DIST  = 3      -- blocks; goal tolerance (a stop radius, not a dynamics constant)
@@ -79,6 +83,7 @@ end
 local burners = { peripheral.find("gas_provider") }
 local sensor  = peripheral.find("altitude_sensor")
 local navtab  = peripheral.find("navigation_table")
+local gimbal  = peripheral.find("gimbal_sensor")
 
 local function applyBurner(u)        -- u -> redstone signal + setTargetAmount on every burner
   u = clamp(u, 0, MAX_OUT)
@@ -123,6 +128,7 @@ end
 -- ---------- GPS poller (position + course-over-ground) ----------
 local gx, gy, gz, gVspeed, gpsAt, gCourse, gVx, gVz = nil, nil, nil, nil, nil, nil, nil, nil
 local gpsTowers = nil   -- last-seen towers, for the map
+local fusedHdg, fusedHdgT = nil, nil   -- gimbal yaw-rate integrated heading, re-anchored to GPS course
 local function gpsLoop()
   local towers, yhist, lastPing = {}, {}, -1e9
   local cX, cZ, cT = nil, nil, nil
@@ -175,12 +181,28 @@ local function readState()
     local age = gpsAt and (os.clock() - gpsAt) or 0
     y, vs, ysrc = gy + (gVspeed or 0) * age, gVspeed or 0, "gps"
   end
-  local heading, hsrc = nil, nil
+  local now = os.clock()
+  local heading, hsrc, yawRate = nil, nil, nil
+  if gimbal then
+    local rates = callm(gimbal, "getAngularRates")
+    if type(rates) == "table" and type(rates.wy) == "number" then yawRate = GYRO_SIGN * rates.wy end
+  end
   if navtab then
     local nh = callm(navtab, "getHeading"); if type(nh) == "number" then heading, hsrc = wrap180(nh + HEADING_OFFSET), "nav" end
   end
+  if heading == nil and yawRate then
+    -- integrate the gimbal yaw rate; re-anchor to GPS course when moving fast enough to trust it
+    if fusedHdg == nil then fusedHdg = gCourse end
+    if fusedHdg ~= nil then
+      if fusedHdgT and now > fusedHdgT then fusedHdg = wrap180(fusedHdg + yawRate * (now - fusedHdgT)) end
+      local vh = math.sqrt((gVx or 0) * (gVx or 0) + (gVz or 0) * (gVz or 0))
+      if gCourse and vh > 1.0 then fusedHdg = wrap180(fusedHdg + HDG_CORRECT * wrap180(gCourse - fusedHdg)) end
+      heading, hsrc = fusedHdg, "gyro"
+    end
+    fusedHdgT = now
+  end
   if heading == nil and gCourse then heading, hsrc = wrap180(gCourse), "course" end
-  return { x = x, y = y, z = z, vspeed = vs, ysrc = ysrc, heading = heading, hsrc = hsrc }
+  return { x = x, y = y, z = z, vspeed = vs, ysrc = ysrc, heading = heading, hsrc = hsrc, yawRate = yawRate }
 end
 
 -- ---------- altitude cascade (mirrors burnertest) ----------
@@ -279,7 +301,7 @@ local function horizStep(target, st)
   end
   local bearing = math.deg(math.atan2(dz, dx))
   local hErr = st.heading and wrap180(bearing - st.heading) or 0
-  local turn = clamp(TURN_GAIN * hErr, -15, 15) * STEER_SIGN
+  local turn = clamp(TURN_GAIN * hErr - TURN_DAMP * (st.yawRate or 0), -15, 15) * STEER_SIGN
   if not st.heading or math.abs(hErr) < TURN_DEADBAND then turn = 0 end
   if turn > 0 then setRelay(relays.right, turn); setRelay(relays.left, 0)
   elseif turn < 0 then setRelay(relays.left, -turn); setRelay(relays.right, 0)
@@ -379,7 +401,7 @@ end
 
 -- ---------- main ----------
 print("shipnav: " .. #burners .. " burner(s)" ..
-      (sensor and " +altimeter" or "") .. (navtab and " +navtable" or "") .. " | GPS")
+      (sensor and " +altimeter" or "") .. (navtab and " +navtable" or "") .. (gimbal and " +gimbal" or "") .. " | GPS")
 if (...) == "reset" then fs.delete(CFG_FILE); print("relay config cleared") end
 loadState()
 loadNav()
@@ -394,7 +416,7 @@ if not st0.y then local fix = gps2.locate(2, 6); if fix then gx, gy, gz = fix.x,
 local target = { x = nil, y = st0.y and math.floor(st0.y + 0.5) or 64, z = nil }
 
 local logf = fs.open(LOG_FILE, "w")
-if logf then logf.writeLine("t,ysrc,hsrc,x,y,z,tx,ty,tz,heading,herr,dist,turn,thrust,vclose,thrustK,dragTau,u,hover,lag,vspeed,lift,fill,filltgt") end
+if logf then logf.writeLine("t,ysrc,hsrc,x,y,z,tx,ty,tz,heading,yaw,herr,dist,turn,thrust,vclose,thrustK,dragTau,u,hover,lag,vspeed,lift,fill,filltgt") end
 local lastLog = nil
 local function logRow(st, u, turn, thrust, vClose, dist, hErr, now)
   if not logf then return end
@@ -403,7 +425,7 @@ local function logRow(st, u, turn, thrust, vClose, dist, hErr, now)
   local b1 = burners[1]
   logf.writeLine(table.concat({
     cv(now), st.ysrc or "", st.hsrc or "", cv(st.x), cv(st.y), cv(st.z),
-    cv(target.x), cv(target.y), cv(target.z), cv(st.heading), cv(hErr), cv(dist),
+    cv(target.x), cv(target.y), cv(target.z), cv(st.heading), cv(st.yawRate), cv(hErr), cv(dist),
     cv(turn), cv(thrust), cv(vClose), cv(nav.thrustK), cv(nav.dragTau), cv(u), cv(alt.integ), cv(alt.leadEst), cv(st.vspeed),
     cv(callm(b1, "getBalloonLift")), cv(callm(b1, "getBalloonFilledVolume")), cv(callm(b1, "getBalloonTargetVolume")),
   }, ","))
