@@ -23,6 +23,8 @@ local gps2  = require("gps2")
 local RADIO_FREQ   = 1000
 local CFG_FILE     = "shipnav.cfg"
 local STATE_FILE   = "burner.state"      -- learned {hover,lag}, shared with burnertest.lua
+local LOG_FILE     = "shipnav.csv"       -- per-run telemetry log (CSV) for review; retrieve + share
+local LOG_DT       = 0.2                 -- seconds between logged rows
 
 -- altitude (Y) cascade -- mirrors burnertest.lua
 local MAX_OUT, MIN_OUT = 500, 5
@@ -52,7 +54,11 @@ local MON_SCALE    = 0.5
 
 -- ---------- helpers ----------
 local function clamp(x, lo, hi) return math.max(lo, math.min(hi, x)) end
-local function callm(p, m, ...) local ok, r = pcall(p[m], ...); if ok then return r end end
+local function callm(p, m, ...) if not p then return nil end local ok, r = pcall(p[m], ...); if ok then return r end end
+local function cv(x)   -- CSV cell: numbers to 3dp, nil to empty
+  if type(x) == "number" then return string.format("%.3f", x) end
+  return x == nil and "" or tostring(x)
+end
 local function wrap180(a) a = (a + 180) % 360 - 180; if a <= -180 then a = a + 360 end; return a end
 local function fmt(x)
   if type(x) == "number" then return x == math.floor(x) and tostring(x) or string.format("%.1f", x) end
@@ -337,6 +343,23 @@ local st0 = readState()
 if not st0.y then local fix = gps2.locate(2, 6); if fix then gx, gy, gz = fix.x, fix.y, fix.z; st0 = readState() end end
 local target = { x = nil, y = st0.y and math.floor(st0.y + 0.5) or 64, z = nil }
 
+local logf = fs.open(LOG_FILE, "w")
+if logf then logf.writeLine("t,ysrc,hsrc,x,y,z,tx,ty,tz,heading,herr,dist,turn,thrust,u,hover,lag,vspeed,lift,fill,filltgt") end
+local lastLog = nil
+local function logRow(st, u, turn, thrust, dist, hErr, now)
+  if not logf then return end
+  if lastLog and (now - lastLog) < LOG_DT then return end
+  lastLog = now
+  local b1 = burners[1]
+  logf.writeLine(table.concat({
+    cv(now), st.ysrc or "", st.hsrc or "", cv(st.x), cv(st.y), cv(st.z),
+    cv(target.x), cv(target.y), cv(target.z), cv(st.heading), cv(hErr), cv(dist),
+    cv(turn), cv(thrust), cv(u), cv(alt.integ), cv(alt.leadEst), cv(st.vspeed),
+    cv(callm(b1, "getBalloonLift")), cv(callm(b1, "getBalloonFilledVolume")), cv(callm(b1, "getBalloonTargetVolume")),
+  }, ","))
+  logf.flush()
+end
+
 local lastTick, lastSave, lastTrail = nil, nil, nil
 local function controlLoop()
   local timer = os.startTimer(CONTROL_DT)
@@ -354,6 +377,7 @@ local function controlLoop()
         trail[#trail + 1] = { x = st.x, z = st.z }; while #trail > 60 do table.remove(trail, 1) end; lastTrail = now
       end
       render(mon, st, target, u, dist, hErr, thrust)
+      logRow(st, u, turn, thrust, dist, hErr, now)
       if not lastSave or now - lastSave > 20 then saveState(); lastSave = now end
       timer = os.startTimer(CONTROL_DT)
     elseif e == "key" then
@@ -384,5 +408,6 @@ parallel.waitForAny(controlLoop, gpsLoop)
 stopHorizontal()
 for _, s in ipairs(BURNER_SIDES) do redstone.setAnalogOutput(s, 0) end
 saveState()
+if logf then logf.close() end
 if mon then pcall(mon.setBackgroundColor, colors.black); pcall(mon.clear) end
-print("shipnav stopped - relays + burner redstone cut.")
+print("shipnav stopped - relays + burner redstone cut. log -> /" .. LOG_FILE)
