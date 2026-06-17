@@ -10,9 +10,10 @@
 -- ALTITUDE HOLD ("burnertest altitude [Y]"):
 --   holds a world-Y by driving BOTH the redstone signal (0-15, on RS_SIDES) and the max gas
 --   output (setTargetAmount); burner output = target*signal/15, split coarse(signal)/fine(target).
---   Control = HOVER feed-forward + predictive P (steers on cy + vspeed*LOOKAHEAD so it eases off
---   EARLY for the laggy balloon) + an anti-windup integral that learns the true hover throttle, so
---   at the setpoint it holds power instead of cutting out and dropping. SMOOTH_TAU slews the output.
+--   Control is CASCADE: altitude error -> a commanded climb rate (capped at V_MAX), then a vspeed
+--   loop whose integral CONVERGES TO the balancing throttle (hover point) on its own - so it stops
+--   pinning 100% until arrival, climbs at a set rate, and eases to hover. LEAD predicts ahead by the
+--   throttle->response lag so it levels off early; SMOOTH_TAU slews the output.
 --   Altitude/vspeed: Avionics altitude_sensor if present, else the radio-GPS (gps2, coarse Y).
 --   The radio-GPS is polled CONTINUOUSLY in the background for live X/Z (and Y when no sensor).
 --   With an advanced MONITOR attached it shows a colour dashboard (gauges, XYZ, vspeed, balloon)
@@ -25,10 +26,12 @@ local RADIO_FREQ = 1000                 -- fleet radio freq, used for the GPS al
 
 local MAX_OUT    = 500   -- ceiling for max gas output (lower it if your burners cap below 500)
 local MIN_OUT    = 5     -- burner's minimum settable target
-local HOVER      = 120   -- baseline throttle that roughly holds level (the integral trims around it)
-local KP, KI     = 3, 1.0  -- predictive proportional gain; integral (hover-trim) gain
-local LOOKAHEAD  = 5.0   -- s of prediction; RAISE to match balloon fill lag if it overshoots
-local SMOOTH_TAU = 2.0   -- output slew time-constant in s (HIGHER = softer ease in/out; tick-rate independent)
+local HOVER0     = 120   -- initial guess for the balancing throttle; the controller refines it live
+local V_MAX      = 2.0   -- max climb/descend rate the controller commands (m/s)
+local K_ALT      = 0.5   -- altitude error -> commanded vspeed (per block); lower = gentler approach
+local KP_V, KI_V = 20, 12  -- vspeed->throttle gains; the integral CONVERGES TO the balancing throttle
+local LEAD       = 3.0   -- s; prediction lead = the throttle->response lag, so it levels off early
+local SMOOTH_TAU = 1.5   -- output slew time-constant in s (HIGHER = softer)
 local CONTROL_DT = 0.1   -- seconds between control ticks (lower = Y/readout updates faster)
 local GPS_FIX_TIME = 1.0 -- GPS: seconds for the initial one-shot fix (sets the default target)
 local GPS_PINGS    = 4   -- GPS: pings for that initial fix
@@ -252,7 +255,7 @@ local function altitude(argY)
   targetY = math.floor(targetY + 0.5)
 
   local buttons = {}
-  local function render(st, u, sig, tgt, err)
+  local function render(st, u, sig, tgt, err, desiredV, hoverEst)
     local dev = mon or term
     local w, h = dev.getSize()
     dev.setBackgroundColor(colors.black); dev.setTextColor(colors.white); dev.clear()
@@ -277,7 +280,7 @@ local function altitude(argY)
     local vs = st.vspeed
     local vcol = colors.lightGray
     if vs and vs > 0.1 then vcol = colors.lime elseif vs and vs < -0.1 then vcol = colors.red end
-    at(dev, 1, y, ("vspeed %s m/s"):format(vs and string.format("%+.2f", vs) or "-"), vcol)
+    at(dev, 1, y, ("vs %s want %+.1f"):format(vs and string.format("%+.2f", vs) or "-", desiredV or 0), vcol)
     y = y + 1
 
     at(dev, 1, y, ("X %s  Z %s"):format(fmt(st.x), fmt(st.z)),
@@ -289,7 +292,7 @@ local function altitude(argY)
     bar(dev, 5, y, gw, u / MAX_OUT, u > 0 and colors.orange or colors.gray)
     at(dev, w - 4, y, ("%3d%%"):format(math.floor(u / MAX_OUT * 100 + 0.5)), colors.white)
     y = y + 1
-    at(dev, 1, y, ("sig %d/15  gas %d"):format(sig, tgt), colors.lightGray)
+    at(dev, 1, y, ("sig %d/15 gas %d  bal~%d"):format(sig, tgt, math.floor((hoverEst or 0) + 0.5)), colors.lightGray)
     y = y + 1
 
     local cap, fillv = callm(rep.p, "getBalloonCapacity"), callm(rep.p, "getBalloonFilledVolume")
@@ -317,7 +320,7 @@ local function altitude(argY)
   print("altitude hold: source " .. (sensor and "altitude_sensor" or "gps") ..
         (gpsReady and " | GPS poller on" or "") .. (mon and " | monitor" or ""))
 
-  local integ, uPrev, lastTick = 0, 0, nil
+  local integ, uPrev, lastTick = HOVER0, 0, nil
   local function mainLoop()
     local timer = os.startTimer(CONTROL_DT)
     while true do
@@ -329,25 +332,27 @@ local function altitude(argY)
         if dt <= 0 then dt = CONTROL_DT end
         lastTick = now
         local st = readState()
-        local u, sig, tgt, err = uPrev, 0, MIN_OUT, 0
+        local u, sig, tgt, err, desiredV = uPrev, 0, MIN_OUT, 0, 0
         if st.y then
           local speed = st.vspeed or 0
           err = targetY - st.y
-          local predErr = targetY - (st.y + speed * LOOKAHEAD)
-          local uRaw = HOVER + KP * predErr + integ
-          if (uRaw > 0 and uRaw < MAX_OUT)
-             or (uRaw <= 0 and err > 0)
-             or (uRaw >= MAX_OUT and err < 0) then
-            integ = clamp(integ + err * KI * dt, -MAX_OUT, MAX_OUT)
+          local predY = st.y + speed * LEAD                       -- account for the response lag
+          desiredV = clamp(K_ALT * (targetY - predY), -V_MAX, V_MAX)
+          local vErr = desiredV - speed
+          local uUnsat = integ + KP_V * vErr
+          if (uUnsat > 0 and uUnsat < MAX_OUT)
+             or (uUnsat <= 0 and vErr > 0)
+             or (uUnsat >= MAX_OUT and vErr < 0) then
+            integ = clamp(integ + KI_V * vErr * dt, 0, MAX_OUT)    -- converges to balancing throttle
           end
-          uRaw = clamp(HOVER + KP * predErr + integ, 0, MAX_OUT)
+          local uRaw = clamp(integ + KP_V * vErr, 0, MAX_OUT)
           u = uPrev + clamp(dt / SMOOTH_TAU, 0, 1) * (uRaw - uPrev)
           uPrev = u
           sig, tgt = applyOutput(u)
         else
           sig, tgt = decompose(uPrev)
         end
-        render(st, u, sig, tgt, err)
+        render(st, u, sig, tgt, err, desiredV, integ)
         timer = os.startTimer(CONTROL_DT)
       elseif e == "key" then
         if ev[2] == keys.up then targetY = targetY + Y_STEP
