@@ -779,6 +779,10 @@ local function main()
     refuelFromChest()
     calibrateGps()                  -- fresh start only: a resume isn't at the dock so can't
                                     -- re-survey; a failed first survey needs 'quarry2 reset'
+  else
+    -- migrate state saved before the skip feature (else airStreak compares/adds vs nil)
+    if state.airStreak == nil then state.airStreak = 0 end
+    if state.skipping  == nil then state.skipping  = false end
   end
 
   print("dir: " .. state.dir .. "  phase: " .. state.phase)
