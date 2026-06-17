@@ -19,7 +19,9 @@
 --   The radio-GPS is polled CONTINUOUSLY in the background for live X/Z (and Y when no sensor).
 --   With an advanced MONITOR attached it shows a colour dashboard (gauges, XYZ, vspeed, balloon)
 --   with touch -10/-1/+1/+10 target buttons; the computer up/down or +/- keys also nudge it, q quits.
---   The gains are guesses - tune in game. Every altitude run logs telemetry to LOG_FILE (CSV) for analysis.
+--   SELF-TUNING: it learns this ship's hover throttle (the integral) and response lag (from the clean fill
+--   telemetry) live, persisting {hover,lag} to STATE_FILE - so each ship and changing condition self-
+--   calibrates with no hardcoding. Every run also logs telemetry to LOG_FILE (CSV) for analysis.
 
 local RS_SIDES   = { "left", "right" }  -- sides the computer feeds redstone into the burners
 local RADIO_FREQ = 1000                 -- fleet radio freq, used for the GPS altitude/position source
@@ -31,9 +33,9 @@ local V_UP       = 1.0   -- max commanded CLIMB rate (m/s)
 local V_DN       = 0.4   -- max commanded DESCENT rate (m/s) - small; a balloon only cools passively
 local K_ALT      = 0.3   -- altitude error -> commanded vspeed (per block); lower = gentler approach
 local KP_V, KI_V = 4, 2   -- vspeed->throttle gains; SLOW given the ~7s response lag; integral tracks hover
-local DOWN_MARGIN = 80   -- throttle held no further than this BELOW the learned hover (stops cut+plummet)
-local UP_MARGIN  = 60    -- ...and no further ABOVE it (stops overfill -> the big vspeed overshoot)
-local LEAD       = 7.0   -- s; prediction lead = measured throttle->vspeed lag (~7s), so it eases off early
+local DOWN_MARGIN = 80   -- MIN throttle band below learned hover (also scales up with hover); stops cut+plummet
+local UP_MARGIN  = 60    -- MIN throttle band above learned hover; stops overfill -> the big vspeed overshoot
+local LEAD       = 7.0   -- s; fallback prediction lead; the live estimate (learned from fill) overrides it
 local SMOOTH_TAU = 0.8   -- output slew time-constant in s (plant is already slow; keep added lag small)
 local CONTROL_DT = 0.1   -- seconds between control ticks (lower = Y/readout updates faster)
 local GPS_FIX_TIME = 1.0 -- GPS: seconds for the initial one-shot fix (sets the default target)
@@ -44,6 +46,8 @@ local MON_SCALE  = 0.5   -- monitor text scale (0.5 suits a 2x3; raise for bigge
 local Y_STEP     = 1     -- target-altitude nudge per key press
 local LOG_FILE   = "burnerlog.csv"  -- altitude-hold telemetry log (CSV); retrieve + share for tuning
 local LOG_DT     = 0.2   -- seconds between logged CSV rows
+local STATE_FILE = "burner.state"   -- per-ship learned tuning {hover,lag}; auto-saved + reloaded (self-calibration)
+local LAG_LEARN  = 0.02  -- EMA rate for the online response-lag (LEAD) estimate from fill telemetry
 
 local function findBurners()
   local list, seen = {}, {}
@@ -199,6 +203,25 @@ local function altitude(argY)
   local mon = peripheral.find("monitor")
   if mon then pcall(mon.setTextScale, MON_SCALE) end
 
+  -- per-ship learned tuning: reload {hover, lag}, fall back to the config defaults
+  local integ, uPrev, lastTick = HOVER0, 0, nil
+  local leadEst = LEAD
+  if fs.exists(STATE_FILE) then
+    local fh = fs.open(STATE_FILE, "r")
+    if fh then
+      local ok, d = pcall(textutils.unserialise, fh.readAll()); fh.close()
+      if ok and type(d) == "table" then
+        if type(d.hover) == "number" then integ = clamp(d.hover, MIN_OUT, MAX_OUT) end
+        if type(d.lag) == "number" then leadEst = clamp(d.lag, 2, 15) end
+      end
+    end
+  end
+  local prevFill, prevFillT, lastSave = nil, nil, nil
+  local function saveState()
+    local fh = fs.open(STATE_FILE, "w")
+    if fh then fh.write(textutils.serialise({ hover = integ, lag = leadEst })); fh.close() end
+  end
+
   -- shared position, updated continuously by the background GPS poller
   local gx, gy, gz, gVspeed, gpsAt = nil, nil, nil, nil, nil
   -- streaming poller: pings at a fixed interval forever, re-solves on every tower response using each
@@ -323,7 +346,7 @@ local function altitude(argY)
     bar(dev, 5, y, gw, u / MAX_OUT, u > 0 and colors.orange or colors.gray)
     at(dev, w - 4, y, ("%3d%%"):format(math.floor(u / MAX_OUT * 100 + 0.5)), colors.white)
     y = y + 1
-    at(dev, 1, y, ("sig %d/15 gas %d  bal~%d"):format(sig, tgt, math.floor((hoverEst or 0) + 0.5)), colors.lightGray)
+    at(dev, 1, y, ("sig %d/15 gas %d  hov~%d lag~%.0f"):format(sig, tgt, math.floor((hoverEst or 0) + 0.5), leadEst), colors.lightGray)
     y = y + 1
 
     local cap, fillv = callm(rep.p, "getBalloonCapacity"), callm(rep.p, "getBalloonFilledVolume")
@@ -351,7 +374,6 @@ local function altitude(argY)
   print("altitude hold: source " .. (sensor and "altitude_sensor" or "gps") ..
         (gpsReady and " | GPS poller on" or "") .. (mon and " | monitor" or ""))
 
-  local integ, uPrev, lastTick = HOVER0, 0, nil
   local function mainLoop()
     local timer = os.startTimer(CONTROL_DT)
     while true do
@@ -367,21 +389,35 @@ local function altitude(argY)
         if st.y then
           local speed = st.vspeed or 0
           err = targetY - st.y
-          local predY = st.y + speed * LEAD                       -- account for the response lag
+          local predY = st.y + speed * leadEst                    -- predict ahead by the learned lag
           desiredV = clamp(K_ALT * (targetY - predY), -V_DN, V_UP)
           local vErr = desiredV - speed
           local uUnsat = integ + KP_V * vErr
           if (uUnsat > 0 and uUnsat < MAX_OUT)
              or (uUnsat <= 0 and vErr > 0)
              or (uUnsat >= MAX_OUT and vErr < 0) then
-            integ = clamp(integ + KI_V * vErr * dt, 0, MAX_OUT)    -- slow tracker of the balancing throttle
+            integ = clamp(integ + KI_V * vErr * dt, 0, MAX_OUT)    -- learns the balancing throttle (hover)
           end
-          local lo = math.max(0, integ - DOWN_MARGIN)             -- band around the learned hover:
-          local hi = math.min(MAX_OUT, integ + UP_MARGIN)         -- floor stops plummet, cap stops overfill
+          local lo = math.max(0, integ - math.max(DOWN_MARGIN, 0.25 * integ))  -- band scales with the
+          local hi = math.min(MAX_OUT, integ + math.max(UP_MARGIN, 0.20 * integ))  -- learned hover (ship-relative)
           local uRaw = clamp(integ + KP_V * vErr, lo, hi)
           u = uPrev + clamp(dt / SMOOTH_TAU, 0, 1) * (uRaw - uPrev)
           uPrev = u
           sig, tgt = applyOutput(u)
+          -- learn the response lag from the CLEAN fill telemetry (fill chasing filltgt is ~1st-order)
+          local fillv, ftgv = callm(rep.p, "getBalloonFilledVolume"), callm(rep.p, "getBalloonTargetVolume")
+          if type(fillv) == "number" and type(ftgv) == "number" then
+            if prevFill and prevFillT and now > prevFillT then
+              local dfill = (fillv - prevFill) / (now - prevFillT)
+              local gap = ftgv - fillv
+              if math.abs(dfill) > 2 and math.abs(gap) > 20 and (gap > 0) == (dfill > 0) then
+                local tau = gap / dfill                            -- time-constant = gap / closing-rate
+                if tau > 2 and tau < 15 then leadEst = leadEst + LAG_LEARN * (tau - leadEst) end
+              end
+            end
+            prevFill, prevFillT = fillv, now
+          end
+          if not lastSave or (now - lastSave) > 20 then saveState(); lastSave = now end
         else
           sig, tgt = decompose(uPrev)
         end
@@ -407,9 +443,11 @@ local function altitude(argY)
   if gpsReady then parallel.waitForAny(mainLoop, gpsLoop) else mainLoop() end
 
   for _, s in ipairs(RS_SIDES) do redstone.setAnalogOutput(s, 0) end
+  saveState()
   if mon then pcall(mon.setBackgroundColor, colors.black); pcall(mon.clear) end
   if logf then logf.close(); print("log written to /" .. LOG_FILE) end
-  print("altitude hold stopped - redstone cut to 0 (burners idle).")
+  print(("altitude hold stopped - redstone cut. learned hover~%d lag~%.1fs saved to %s")
+    :format(integ, leadEst, STATE_FILE))
 end
 
 local function loop()
