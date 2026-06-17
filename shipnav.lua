@@ -93,11 +93,12 @@ end
 -- ---------- relays (wheel + throttle) ----------
 local relays
 local function promptRelays()
-  print("Wire/place the redstone relays, then name them. Peripherals seen:")
+  print("Name each relay by its NETWORK name exactly as listed (e.g. redstone_relay_1, no mod prefix),")
+  print("and the RELAY's own output face (the side wired/touching the wheel or throttle). Peripherals seen:")
   for _, n in ipairs(peripheral.getNames()) do print("  " .. n .. "  (" .. (peripheral.getType(n) or "?") .. ")") end
   local function ask(label)
-    write(label .. " relay name: "); local name = (read() or ""):gsub("%s+", "")
-    write(label .. " side (front/back/left/right/top/bottom): "); local side = (read() or ""):gsub("%s+", "")
+    write(label .. " relay name (e.g. redstone_relay_1): "); local name = (read() or ""):gsub("%s+", "")
+    write(label .. " relay output side (front/back/left/right/top/bottom): "); local side = (read() or ""):gsub("%s+", "")
     return { name = name ~= "" and name or nil, side = side ~= "" and side or "back" }
   end
   return { left = ask("LEFT (turn)"), right = ask("RIGHT (turn)"), throttle = ask("THROTTLE (fwd)") }
