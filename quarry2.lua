@@ -2,14 +2,23 @@
 -- DIRECTIONAL: asks at startup whether to mine top->down or bottom->up.
 --   down: clears top to bedrock, then builds the staircase (original behaviour)
 --   up:   digs a corner shaft to bedrock first, then clears upward, then stairs
--- place turtle on the TOP corner of the 16x16, facing along the +X edge.
+-- place turtle on the TOP corner of the 16x16; it digs 16 along its facing and 16 to its
+-- right. (Heading is no longer assumed: GPS calibration MEASURES the world heading of that
+-- facing on first boot, so face whichever edge orients the pit and the map still reads true.)
 -- fuel chest directly ABOVE the turtle, output chest directly BEHIND it (same for both).
--- comms: turtle carries a mini radio antenna (pickaxe on the other side); talks to
---   the store via comms.lua over the radio tower. needs comms.lua present on the turtle.
+-- comms: turtle carries a mini radio antenna (pickaxe on the other side); talks to the store
+--   via comms.lua over the radio tower. needs comms.lua + gps2.lua present on the turtle.
+-- GPS: first boot does a 2-fix heading survey at the dock, saving that spot as HOME (world
+--   origin + absolute heading). GPS X/Z is authoritative -- the turtle snaps its position to a
+--   fix at safe points and on restart, so a reboot or shove can't lose it; dead reckoning only
+--   bridges between fixes. Telemetry reports true world (F3) coords + heading. World Y rides
+--   dead reckoning (Y PENDING until Tower Delta #5 is built -- set TRUST_GPS_Y then). No towers
+--   / failed survey -> falls back to legacy local coords.
 -- run: quarry2        (start / resume; asks the two chest names on first boot, saved to quarry2.cfg)
 --      quarry2 reset  (wipe saved state AND chest config, start fresh)
 
 local comms = require("comms")
+local gps2  = require("gps2")
 
 local WIDTH       = 16
 local LENGTH      = 16
@@ -27,6 +36,20 @@ local RADIO_FREQ     = 1000     -- must match the store's RADIO_FREQ
 local TELEM_INTERVAL = 5        -- seconds between telemetry pings while working
 local DEPOSIT_CHEST  = ""       -- chest BEHIND the turtle (marked input); set on first boot
 local FUEL_CHEST     = ""       -- chest ABOVE the turtle (marked fuel);  set on first boot
+
+-- GPS world-coord upgrade (PARTIAL: X/Z authoritative, Y PENDING). Calibration at the dock
+-- saves a world origin (= HOME, the return point) + measured absolute heading. GPS X/Z is the
+-- source of truth: at safe points the turtle SNAPS its grid position to the fix (fixes "lost on
+-- restart" -- a reboot or shove can no longer desync it), with dead reckoning the fast
+-- integrator between fixes. Safe because fixes are deterministic (zero jitter) and the
+-- systematic bias cancels in the local snap. Vertical (Y) geometry is too weak on the current
+-- 4-tower set (~6m off) so world Y rides dead reckoning (exact in a shaft); flip TRUST_GPS_Y
+-- once Tower Delta (#5) is up and gpsrange confirms Y (flipping it also needs resync to snap
+-- state.pos.y; today it snaps X/Z only). Calibration MEASURES absolute heading, dropping the old
+-- "place facing +X" contract; no towers / failed survey falls back to legacy local behavior.
+local TRUST_GPS_Y        = false  -- becomes true when Tower Delta lands + vertical is verified
+local RESYNC_INTERVAL    = 30     -- seconds between GPS snaps at safe points (locate ~2s each)
+local DISPLACE_THRESHOLD = 5      -- snap gap (blocks) above this also fires a "displaced" alert
 
 local KEEP = {
   ["minecraft:andesite"]      = true,
@@ -53,6 +76,7 @@ local DIR = { [0]={x=1,z=0}, [1]={x=0,z=1}, [2]={x=-1,z=0}, [3]={x=0,z=-1} }
 
 local args = {...}
 local state
+local lastResync, lastGpsOk = 0, nil   -- GPS re-sync throttle + last-fix-ok flag (for telem)
 
 local function isKeeper(name)
   if KEEP[name] or name:find("ore", 1, true) then return true end
@@ -112,14 +136,14 @@ local function isProtected(name)
 end
 
 local alertAt = {}
-local function alert(kind)
+local function alert(kind, msg)
   local now = os.clock()
   if alertAt[kind] and now - alertAt[kind] < 30 then return end
   alertAt[kind] = now
   if not comms.up() then return end
   comms.send("store", {
     type = "alert", id = os.getComputerID(), label = os.getComputerLabel(),
-    msg = kind, phase = state and state.phase,
+    msg = msg or kind, phase = state and state.phase,
   }, STORE_PROTOCOL)
 end
 
@@ -189,6 +213,38 @@ end
 
 local function turnTo(h)
   while state.heading ~= h do turnRight() end
+end
+
+-- local grid pos -> world coords, using the calibrated origin + worldHeading. Local +X
+-- (local heading 0) points along world DIR[worldHeading]; local +Z along the next dir CW;
+-- turnRight increments heading in both frames, so absolute heading = worldHeading + local
+-- heading. World Y rides dead reckoning off origin.y (Y pending). Only valid when calibrated.
+local function l2w(p)
+  local o, wh = state.origin, state.worldHeading
+  local fx = DIR[wh]                 -- world delta per +1 local x
+  local fz = DIR[(wh + 1) % 4]       -- world delta per +1 local z
+  return {
+    x = o.x + p.x * fx.x + p.z * fz.x,
+    y = o.y + p.y,
+    z = o.z + p.x * fx.z + p.z * fz.z,
+  }
+end
+
+local function absHeading()
+  return (state.worldHeading + state.heading) % 4
+end
+
+-- world coords -> local grid cell (inverse of l2w): project the world offset from origin onto
+-- the calibrated forward/right axes, round to the nearest block. X/Z only (Y is pending).
+local function w2l(W)
+  local o, wh = state.origin, state.worldHeading
+  local fx = DIR[wh]
+  local fz = DIR[(wh + 1) % 4]
+  local dwx, dwz = W.x - o.x, W.z - o.z
+  return {
+    x = math.floor(dwx * fx.x + dwz * fx.z + 0.5),
+    z = math.floor(dwx * fz.x + dwz * fz.z + 0.5),
+  }
 end
 
 local function costHome()
@@ -323,6 +379,55 @@ local function refuelFromChest()
   end
 end
 
+-- boot calibration: at the dock (fresh start only, local origin = 0,0,0) survey the world
+-- origin + absolute heading via two GPS fixes one block apart. Uses dig-capable move callbacks
+-- so a block in front (the quarry top corner) is no obstacle; ends physically back on the dock
+-- with state.pos untouched. On any fix/move failure, stays in legacy local mode (gps off).
+local DIRNAME = { [0] = "+X", [1] = "+Z", [2] = "-X", [3] = "-Z" }
+
+local calFwded = false                    -- true while the survey has us one block off the dock
+local function calFwd()
+  local tries = 0
+  while turtle.detect() do
+    if not turtle.dig() then
+      tries = tries + 1
+      if tries > 20 then return false end
+      sleep(0.3)
+    end
+  end
+  if turtle.forward() then calFwded = true; return true end
+  return false
+end
+
+local function calBack()
+  for _ = 1, 5 do if turtle.back() then calFwded = false; return true end; sleep(0.3) end
+  return false
+end
+
+local function calibrateGps()
+  if not comms.up() then print("gps: no antenna, legacy local mode"); return end
+  print("gps: calibrating heading...")    -- survey runs along local head 0 (=+X) set by fresh()
+  calFwded = false
+  local origin, heading = gps2.calibrate(calFwd, calBack)
+  if calFwded then                         -- moved out but never got back: we're off the dock
+    alert("gps offdock", "gps calibration left me off the dock - check me")
+    for _ = 1, 10 do if calBack() then break end; sleep(0.5) end
+  end
+  if not origin then
+    print("gps: calibration failed (" .. tostring(heading) .. "); legacy local mode")
+    state.gps = false; save(); return
+  end
+  -- round to integer block coords (the fractional part is GPS noise; within the ~1m budget)
+  state.origin = { x = math.floor(origin.x + 0.5), y = math.floor(origin.y + 0.5),
+                   z = math.floor(origin.z + 0.5) }
+  state.worldHeading = heading
+  state.gps = true
+  save()
+  print(("gps: origin %d,%d,%d facing %s%s"):format(
+    state.origin.x, state.origin.y, state.origin.z, DIRNAME[heading],
+    TRUST_GPS_Y and "" or " (Y pending)"))
+end
+
 local EST_DEPTH = 72   -- rough surface-to-bedrock, for % estimate only
 
 local function pct()
@@ -347,11 +452,14 @@ end
 local function checkin()
   if not comms.up() then return nil end
   local fl = turtle.getFuelLevel()
+  -- world coords when calibrated, else legacy local pos (gps=nil tells the store which)
+  local pos, head, gpsFlag = state.pos, nil, nil
+  if state.gps and state.origin then pos = l2w(state.pos); head = absHeading(); gpsFlag = lastGpsOk end
   comms.send("store", {
     type = "telem", kind = "quarry", id = os.getComputerID(), label = os.getComputerLabel(),
     phase = state.phase, dir = state.dir, pct = pct(),
     fuel = (fl == "unlimited") and FUEL_TARGET or fl, fuelMax = FUEL_TARGET,
-    pos = { x = state.pos.x, y = state.pos.y, z = state.pos.z },
+    pos = { x = pos.x, y = pos.y, z = pos.z }, head = head, gps = gpsFlag,
     last = lastBlock, halted = (state.phase == "recalled"),
   }, STORE_PROTOCOL)
   local r = comms.receive(STORE_PROTOCOL, 1.5)
@@ -367,10 +475,32 @@ local function requestRecall(returnPhase)
   save()
 end
 
+-- opportunistic GPS snap: at a safe point, take a fix and SNAP the local grid X/Z to it -- GPS
+-- is authoritative, dead reckoning only bridges between fixes. Normally a no-op (gap 0: GPS
+-- agrees with DR), it self-corrects a turtle that rebooted or got shoved. A large gap is also a
+-- physical displacement, so it pings. Y is pending (snapped axes are X/Z only). force ignores
+-- the cadence gate (used on restart and at the surface dock, where the fix is most reliable).
+local function resync(force)
+  if not (state.gps and state.origin) or not comms.up() then return end
+  if not force and os.clock() - lastResync < RESYNC_INTERVAL then return end
+  lastResync = os.clock()
+  local fix = gps2.tryFix(0)
+  if not fix then lastGpsOk = false; return end
+  lastGpsOk = true
+  local l = w2l(fix)
+  local gap = math.max(math.abs(l.x - state.pos.x), math.abs(l.z - state.pos.z))
+  if gap == 0 then return end
+  print(("gps: snap X/Z %d,%d -> %d,%d"):format(state.pos.x, state.pos.z, l.x, l.z))
+  if gap > DISPLACE_THRESHOLD then alert("displaced", ("displaced %d, re-homed"):format(gap)) end
+  state.pos.x, state.pos.z = l.x, l.z       -- GPS owns X/Z; dead reckoning keeps Y (pending)
+  save()
+end
+
 local lastTelem = 0
 local function checkpoint(returnPhase)
   if os.clock() - lastTelem < TELEM_INTERVAL then return false end
   lastTelem = os.clock()
+  resync(false)
   if checkin() == "rtb" then requestRecall(returnPhase); return true end
   return false
 end
@@ -597,9 +727,12 @@ local function main()
     state.phase = (state.dir == "up") and "descend" or "mine"
     save()
     refuelFromChest()
+    calibrateGps()                  -- fresh start only: a resume isn't at the dock so can't
+                                    -- re-survey; a failed first survey needs 'quarry2 reset'
   end
 
   print("dir: " .. state.dir .. "  phase: " .. state.phase)
+  resync(true)                      -- recover X/Z from GPS after a restart (could have drifted/lost)
   while state.phase ~= "done" do
     if state.phase == "descend" then
       runDescend()
@@ -609,6 +742,7 @@ local function main()
       serviceHome(state.returnPhase)
       dumpInventory()
       refuelFromChest()
+      resync(true)                  -- at the surface dock: most reliable fix
       if checkin() == "rtb" then
         state.phase = "recalled"; save()
       else
@@ -619,6 +753,7 @@ local function main()
     elseif state.phase == "recalled" then
       serviceHome(state.returnPhase)
       dumpInventory()
+      resync(true)                  -- at the surface dock: most reliable fix
       print("recalled - holding at home until continue")
       while checkin() ~= "continue" do sleep(3) end
       refuelFromChest()

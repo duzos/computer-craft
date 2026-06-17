@@ -18,14 +18,27 @@
 --   water sources at grid (4,4)(4,11)(11,4)(11,11): +-4 hydrates all 256 cells; the
 --   turtle skips those cells (and the (0,0) shaft), leaving ~252 plantable.
 -- the three chests sit off the plot and out of the shaft, on the store's wired net.
+-- GPS (needs comms.lua + gps2.lua + a radio antenna): first boot surveys HOME (world origin +
+-- heading) from the y=2 travel plane; reports true world coords and snaps X/Z from GPS at safe
+-- points + on restart so a reboot can't lose it. World Y rides dead reckoning (Y pending).
 -- run: wheatfarm        (start / resume from saved state)
 --      wheatfarm reset   (wipe saved state; only when docked)
 
 local comms = require("comms")
+local gps2  = require("gps2")
 
 local STORE_PROTOCOL = "store"
 local STORE_NAME     = "store"
 local RADIO_FREQ     = 1000        -- must match the store's RADIO_FREQ
+
+-- GPS world-coord upgrade (X/Z authoritative, Y PENDING). Calibration at the dock saves a world
+-- origin (= HOME) + measured absolute heading; GPS X/Z snaps the position at safe points and on
+-- restart so a reboot or shove can't lose the farm. World Y rides dead reckoning, pending until
+-- Tower Delta (#5) is built + gpsrange confirms Y -> set TRUST_GPS_Y (which also needs resync to
+-- snap Y; today X/Z only). No towers / failed survey -> legacy local mode, logged.
+local TRUST_GPS_Y        = false
+local RESYNC_INTERVAL    = 30     -- seconds between GPS snaps at safe points
+local DISPLACE_THRESHOLD = 5      -- snap gap (blocks) above this also fires a "displaced" alert
 
 -- dock chest names are prompted on first boot and saved to wheatfarm.cfg (run
 -- 'wheatfarm reset' to re-enter); blank = standalone with no store link.
@@ -56,6 +69,7 @@ local args = { ... }
 local state
 local last = "-"
 local cellTick = 0
+local lastResync, lastGpsOk = 0, nil
 
 ----------------------------------------------------------------- state
 local function fresh()
@@ -70,6 +84,23 @@ local function load()
   return state ~= nil
 end
 local function setPhase(p) state.phase = p; save() end
+
+-- GPS world transform (head 0 = +Z; local +X is head 1, one CW turn). worldHead0 = the world
+-- compass (gps2.HEADINGS: 0=+X 1=+Z 2=-X 3=-Z) that local head-0 forward points to. Only valid
+-- once calibrated; callers guard on state.gps.
+local H = gps2.HEADINGS
+local function l2w(p)
+  local o, w0 = state.origin, state.worldHead0
+  local vZ, vX = H[w0], H[(w0 + 1) % 4]
+  return { x = o.x + p.x * vX.x + p.z * vZ.x, y = o.y + p.y, z = o.z + p.x * vX.z + p.z * vZ.z }
+end
+local function w2l(W)
+  local o, w0 = state.origin, state.worldHead0
+  local vZ, vX = H[w0], H[(w0 + 1) % 4]
+  local dx, dz = W.x - o.x, W.z - o.z
+  return { x = math.floor(dx * vX.x + dz * vX.z + 0.5), z = math.floor(dx * vZ.x + dz * vZ.z + 0.5) }
+end
+local function absHead() return (state.worldHead0 + state.head) % 4 end
 
 -- a queued "reboot" from the store is honored wherever we read a reply. replies are read
 -- only between completed moves, and every move persists state, so a reboot resumes via
@@ -108,10 +139,12 @@ local function checkin(phase)
   if phase then setPhase(phase) end
   if not comms.up() then return nil end
   local fl = turtle.getFuelLevel()
+  local pos, head, gpsFlag = state.pos, nil, nil
+  if state.gps and state.origin then pos = l2w(state.pos); head = absHead(); gpsFlag = lastGpsOk end
   comms.send(STORE_NAME, {
     type = "telem", id = os.getComputerID(), label = os.getComputerLabel(),
     phase = state.phase, pct = passPct(), fuel = (fl == "unlimited") and FUEL_FULL or fl, fuelMax = FUEL_FULL,
-    pos = { x = state.pos.x, y = state.pos.y, z = state.pos.z }, halted = state.halted, last = last,
+    pos = { x = pos.x, y = pos.y, z = pos.z }, head = head, gps = gpsFlag, halted = state.halted, last = last,
   }, STORE_PROTOCOL)
   local r = comms.receive(STORE_PROTOCOL, 0.3)
   local body = r and r.body
@@ -189,6 +222,69 @@ local function dock()
   goTo(0, 0, 2)
   while state.pos.y > 0 do if not down() then break end end
   face(0)
+end
+
+----------------------------------------------------------------- GPS calibration + re-sync
+local DIRNAME = { [0] = "+X", [1] = "+Z", [2] = "-X", [3] = "-Z" }
+
+local calFwded = false                    -- true while the survey has us one block off the shaft
+local function calFwd()                   -- dig-capable one-block forward (over the crops at y2)
+  local n = 0
+  while turtle.detect() do
+    if not turtle.dig() then turtle.attack() end
+    n = n + 1; if n > 40 then return false end
+  end
+  if turtle.forward() then calFwded = true; return true end
+  return false
+end
+local function calBack()
+  for _ = 1, 5 do if turtle.back() then calFwded = false; return true end; sleep(0.3) end
+  return false
+end
+
+local function calibrateGps()
+  if not comms.up() then print("gps: no antenna, legacy local mode"); return end
+  launch()                                -- rise to y=2 (clear of the crops) for the survey
+  face(0)                                 -- head 0 (+Z) for the survey
+  print("gps: calibrating heading...")
+  calFwded = false
+  local origin, h = gps2.calibrate(calFwd, calBack)
+  if calFwded then                        -- moved out but never got back: re-home over the shaft
+    alert("gps offdock")
+    for _ = 1, 10 do if calBack() then break end; sleep(0.5) end
+  end
+  if not origin then
+    print("gps: calibration failed (" .. tostring(h) .. "); legacy local mode")
+    state.gps = false; dock(); save(); return
+  end
+  -- survey ran at local (0,0,2): origin (local 0,0,0) shares X/Z, sits 2 lower (Y pending anyway)
+  state.origin = { x = math.floor(origin.x + 0.5), y = math.floor(origin.y + 0.5) - 2,
+                   z = math.floor(origin.z + 0.5) }
+  state.worldHead0 = h
+  state.gps = true
+  save()
+  dock()                                  -- back down to the dock
+  print(("gps: home %d,%d,%d facing %s%s"):format(state.origin.x, state.origin.y, state.origin.z,
+    DIRNAME[h], TRUST_GPS_Y and "" or " (Y pending)"))
+end
+
+-- GPS owns X/Z: snap the local position to a fix at safe points (normally a no-op; corrects a
+-- reboot/shove). Dead reckoning bridges between fixes; Y is pending (X/Z only). force ignores the
+-- cadence gate (restart + at the dock, the most reliable fix).
+local function resync(force)
+  if not (state.gps and state.origin) or not comms.up() then return end
+  if not force and os.clock() - lastResync < RESYNC_INTERVAL then return end
+  lastResync = os.clock()
+  local fix = gps2.tryFix(0)
+  if not fix then lastGpsOk = false; return end
+  lastGpsOk = true
+  local l = w2l(fix)
+  local gap = math.max(math.abs(l.x - state.pos.x), math.abs(l.z - state.pos.z))
+  if gap == 0 then return end
+  print(("gps: snap X/Z %d,%d -> %d,%d"):format(state.pos.x, state.pos.z, l.x, l.z))
+  if gap > DISPLACE_THRESHOLD then alert("displaced") end
+  state.pos.x, state.pos.z = l.x, l.z
+  save()
 end
 
 ----------------------------------------------------------------- inventory
@@ -369,6 +465,7 @@ end
 
 -- resume from any saved position: climb to the travel plane, re-dock, ship what's carried
 local function recover()
+  resync(true)                          -- re-localize X/Z from GPS first (recover a lost turtle)
   if not atDock() then
     while state.pos.y < 2 do if not up() then break end end
     dock()
@@ -380,6 +477,7 @@ end
 local function cycle()
   holdIfHalted()
   refuel()
+  resync(false)                         -- keep X/Z honest at the dock
   if invCount(SEED_ID) < SEED_KEEP or invCount(BONEMEAL_ID) < BONEMEAL_POKES then drawSupply() end
 
   launch()
@@ -445,6 +543,8 @@ local function main()
   if OUTPUT_CHEST ~= "" and comms.up() then request("mark " .. OUTPUT_CHEST .. " input") end
   print(("wheatfarm online (freq %d, phase %s)"):format(RADIO_FREQ, state.phase))
   recover()
+  refuel()
+  if not state.gps then calibrateGps() end   -- at the dock after recover; one-time on first boot
   while true do cycle() end
 end
 
