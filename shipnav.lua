@@ -43,8 +43,9 @@ local STEER_SIGN   = 1      -- flip to -1 if the wheel turns the wrong way
 local HEADING_OFFSET = 0    -- deg added to a nav_table heading to match the GPS x/z frame
 local TURN_GAIN    = 0.10   -- wheel signal per deg of heading error
 local TURN_DEADBAND = 8     -- deg; inside this, stop steering
-local THRUST_GAIN  = 0.4    -- throttle units per block of horizontal distance
-local THRUST_MIN   = 4      -- min forward signal when driving (overcome stiction)
+local APPROACH_TAU = 4.0    -- horizontal: plan to close the remaining distance over ~this many s (higher = slows earlier)
+local V_FWD_MAX    = 8.0    -- max commanded closing speed (blocks/s)
+local THRUST_GAIN_V = 3.0   -- forward signal per (block/s) of closing-speed shortfall
 local ARRIVE_DIST  = 3      -- blocks; within this of the X/Z target = stop
 local CONTROL_DT   = 0.2
 local GPS_PING_EVERY = 0.15
@@ -120,7 +121,7 @@ local function stopHorizontal()
 end
 
 -- ---------- GPS poller (position + course-over-ground) ----------
-local gx, gy, gz, gVspeed, gpsAt, gCourse = nil, nil, nil, nil, nil, nil
+local gx, gy, gz, gVspeed, gpsAt, gCourse, gVx, gVz = nil, nil, nil, nil, nil, nil, nil, nil
 local gpsTowers = nil   -- last-seen towers, for the map
 local function gpsLoop()
   local towers, yhist, lastPing = {}, {}, -1e9
@@ -143,9 +144,13 @@ local function gpsLoop()
       local fix = gps2.trilaterate(pts)
       if fix then
         gx, gy, gz, gpsAt = fix.x, fix.y, fix.z, now
-        yhist[#yhist + 1] = { t = now, y = fix.y }
+        yhist[#yhist + 1] = { t = now, x = fix.x, y = fix.y, z = fix.z }
         while #yhist > 1 and now - yhist[1].t > GPS_AVG do table.remove(yhist, 1) end
-        if #yhist >= 2 and now > yhist[1].t then gVspeed = (fix.y - yhist[1].y) / (now - yhist[1].t) end
+        if #yhist >= 2 and now > yhist[1].t then
+          local h0, dtv = yhist[1], now - yhist[1].t
+          gVspeed = (fix.y - h0.y) / dtv
+          gVx, gVz = (fix.x - h0.x) / dtv, (fix.z - h0.z) / dtv
+        end
         if cX then
           local dx, dz = fix.x - cX, fix.z - cZ
           if math.sqrt(dx * dx + dz * dz) >= COURSE_MIN_MOVE then
@@ -199,21 +204,14 @@ local function altStep(targetY, st, dt, now)
   if not st.y or #burners == 0 then local s, t = applyBurner(alt.uPrev); return alt.uPrev, s, t, 0, 0 end
   local speed = st.vspeed or 0
   local err = targetY - st.y
-  -- ADAPTIVE: cap approach speed so it can be arrested within the learned lag (slows down in time,
-  -- no overshoot) yet stays fast far away; predict ahead by the lag so it eases off early.
-  local vCap = math.abs(err) / math.max(alt.leadEst, 2)
-  local desiredV = clamp(K_ALT * (targetY - (st.y + speed * alt.leadEst)),
-                         -math.min(V_DN, vCap), math.min(V_UP, vCap))
+  local desiredV = clamp(K_ALT * (targetY - (st.y + speed * alt.leadEst)), -V_DN, V_UP)
   local vErr = desiredV - speed
-  -- hover integral adapts ONLY near steady state, so a climb/descent can't wind it up (was the overshoot)
   local uUnsat = alt.integ + KP_V * vErr
-  if math.abs(vErr) < 0.6 and uUnsat > 0 and uUnsat < MAX_OUT then
+  if (uUnsat > 0 and uUnsat < MAX_OUT) or (uUnsat <= 0 and vErr > 0) or (uUnsat >= MAX_OUT and vErr < 0) then
     alt.integ = clamp(alt.integ + KI_V * vErr * dt, 0, MAX_OUT)
   end
-  -- ADAPTIVE band: up-band shrinks toward the target (no overfill+overshoot); down-band kept open (braking)
-  local bandFrac = clamp(math.abs(err) / 25, 0.15, 1.0)
   local lo = math.max(0, alt.integ - math.max(DOWN_MARGIN, 0.45 * alt.integ))
-  local hi = math.min(MAX_OUT, alt.integ + math.max(UP_MARGIN, 0.40 * alt.integ) * bandFrac)
+  local hi = math.min(MAX_OUT, alt.integ + math.max(UP_MARGIN, 0.40 * alt.integ))
   local u = alt.uPrev + clamp(dt / SMOOTH_TAU, 0, 1) * (clamp(alt.integ + KP_V * vErr, lo, hi) - alt.uPrev)
   alt.uPrev = u
   local sig, tgt = applyBurner(u)
@@ -253,11 +251,17 @@ local function horizStep(target, st)
   elseif turn < 0 then setRelay(relays.left, -turn); setRelay(relays.right, 0)
   else setRelay(relays.left, 0); setRelay(relays.right, 0) end
   -- forward only when roughly aligned; ease near arrival; scale by alignment
+  -- closing speed toward the target (blocks/s) from GPS velocity
+  local ux, uz = dx / dist, dz / dist
+  local vClose = (gVx or 0) * ux + (gVz or 0) * uz
+  -- decelerate as it approaches: cap the WANTED closing speed by distance so it coasts to a stop,
+  -- and only push when below it (throttle is forward-only, so braking = stop pushing + let drag bleed it)
+  local vWant = clamp(dist / APPROACH_TAU, 0, V_FWD_MAX)
   local align = st.heading and math.max(0, math.cos(math.rad(hErr))) or 0
-  local thrust = clamp(THRUST_GAIN * dist, THRUST_MIN, 15) * align
+  local thrust = clamp(THRUST_GAIN_V * (vWant - vClose), 0, 15) * align
   if math.abs(hErr) > 60 then thrust = 0 end
   setRelay(relays.throttle, 15 - thrust)        -- inverted: 15 = stop
-  return turn, thrust, dist, hErr
+  return turn, thrust, dist, hErr, vClose
 end
 
 -- ---------- map + dashboard ----------
@@ -352,9 +356,9 @@ if not st0.y then local fix = gps2.locate(2, 6); if fix then gx, gy, gz = fix.x,
 local target = { x = nil, y = st0.y and math.floor(st0.y + 0.5) or 64, z = nil }
 
 local logf = fs.open(LOG_FILE, "w")
-if logf then logf.writeLine("t,ysrc,hsrc,x,y,z,tx,ty,tz,heading,herr,dist,turn,thrust,u,hover,lag,vspeed,lift,fill,filltgt") end
+if logf then logf.writeLine("t,ysrc,hsrc,x,y,z,tx,ty,tz,heading,herr,dist,turn,thrust,vclose,u,hover,lag,vspeed,lift,fill,filltgt") end
 local lastLog = nil
-local function logRow(st, u, turn, thrust, dist, hErr, now)
+local function logRow(st, u, turn, thrust, vClose, dist, hErr, now)
   if not logf then return end
   if lastLog and (now - lastLog) < LOG_DT then return end
   lastLog = now
@@ -362,7 +366,7 @@ local function logRow(st, u, turn, thrust, dist, hErr, now)
   logf.writeLine(table.concat({
     cv(now), st.ysrc or "", st.hsrc or "", cv(st.x), cv(st.y), cv(st.z),
     cv(target.x), cv(target.y), cv(target.z), cv(st.heading), cv(hErr), cv(dist),
-    cv(turn), cv(thrust), cv(u), cv(alt.integ), cv(alt.leadEst), cv(st.vspeed),
+    cv(turn), cv(thrust), cv(vClose), cv(u), cv(alt.integ), cv(alt.leadEst), cv(st.vspeed),
     cv(callm(b1, "getBalloonLift")), cv(callm(b1, "getBalloonFilledVolume")), cv(callm(b1, "getBalloonTargetVolume")),
   }, ","))
   logf.flush()
@@ -380,12 +384,12 @@ local function controlLoop()
       lastTick = now
       local st = readState()
       local u = altStep(target.y, st, dt, now)
-      local turn, thrust, dist, hErr = horizStep(target, st)
+      local turn, thrust, dist, hErr, vClose = horizStep(target, st)
       if st.x and (not lastTrail or now - lastTrail > 1) then
         trail[#trail + 1] = { x = st.x, z = st.z }; while #trail > 60 do table.remove(trail, 1) end; lastTrail = now
       end
       render(mon, st, target, u, dist, hErr, thrust)
-      logRow(st, u, turn, thrust, dist, hErr, now)
+      logRow(st, u, turn, thrust, vClose, dist, hErr, now)
       if not lastSave or now - lastSave > 20 then saveState(); lastSave = now end
       timer = os.startTimer(CONTROL_DT)
     elseif e == "key" then
