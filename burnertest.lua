@@ -29,12 +29,12 @@ local RADIO_FREQ = 1000                 -- fleet radio freq, used for the GPS al
 local MAX_OUT    = 500   -- ceiling for max gas output (lower it if your burners cap below 500)
 local MIN_OUT    = 5     -- burner's minimum settable target
 local HOVER0     = 250   -- hover throttle seed (logs: steady lift ~= 3*throttle, ship weight ~750 -> ~250)
-local V_UP       = 2.5   -- max commanded CLIMB rate (m/s)
-local V_DN       = 1.0   -- max commanded DESCENT rate (m/s) - balloon descends passively (cooling-limited)
+local V_UP       = 4.0   -- max commanded CLIMB rate (m/s)
+local V_DN       = 2.0   -- max commanded DESCENT rate (m/s) - balloon descends passively (cooling-limited)
 local K_ALT      = 0.3   -- altitude error -> commanded vspeed (per block); lower = gentler approach
 local KP_V, KI_V = 4, 2   -- vspeed->throttle gains; SLOW given the ~7s response lag; integral tracks hover
-local DOWN_MARGIN = 80   -- MIN throttle band below learned hover (also scales up with hover); stops cut+plummet
-local UP_MARGIN  = 60    -- MIN throttle band above learned hover; stops overfill -> the big vspeed overshoot
+local DOWN_MARGIN = 120  -- MIN throttle band below learned hover (also scales up with hover); stops cut+plummet
+local UP_MARGIN  = 120   -- MIN throttle band above learned hover; wider = faster (but more overshoot risk)
 local LEAD       = 7.0   -- s; fallback prediction lead; the live estimate (learned from fill) overrides it
 local SMOOTH_TAU = 0.8   -- output slew time-constant in s (plant is already slow; keep added lag small)
 local CONTROL_DT = 0.1   -- seconds between control ticks (lower = Y/readout updates faster)
@@ -398,8 +398,8 @@ local function altitude(argY)
              or (uUnsat >= MAX_OUT and vErr < 0) then
             integ = clamp(integ + KI_V * vErr * dt, 0, MAX_OUT)    -- learns the balancing throttle (hover)
           end
-          local lo = math.max(0, integ - math.max(DOWN_MARGIN, 0.25 * integ))  -- band scales with the
-          local hi = math.min(MAX_OUT, integ + math.max(UP_MARGIN, 0.20 * integ))  -- learned hover (ship-relative)
+          local lo = math.max(0, integ - math.max(DOWN_MARGIN, 0.45 * integ))  -- band scales with the
+          local hi = math.min(MAX_OUT, integ + math.max(UP_MARGIN, 0.40 * integ))  -- learned hover (ship-relative)
           local uRaw = clamp(integ + KP_V * vErr, lo, hi)
           u = uPrev + clamp(dt / SMOOTH_TAU, 0, 1) * (uRaw - uPrev)
           uPrev = u
