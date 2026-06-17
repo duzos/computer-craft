@@ -131,4 +131,63 @@ function gps2.locate(timeout, pings)
   return fix, pts
 end
 
+-- Heading convention matches the turtle nav code (quarry2's DIR): 0=+X, 1=+Z,
+-- 2=-X, 3=-Z, so turnRight() increments heading mod 4. A turtle MEASURES which of
+-- these its local "forward" points along (calibrate) instead of assuming it from
+-- placement.
+gps2.HEADINGS = { [0] = { x = 1, z = 0 }, [1] = { x = 0, z = 1 },
+                  [2] = { x = -1, z = 0 }, [3] = { x = 0, z = -1 } }
+
+-- pure: given two fixes where b is one forward step from a, return the absolute
+-- heading 0..3 of the dominant signed horizontal axis of (b-a), or nil when the
+-- delta is degenerate -- either the move barely registered (< half a block, fix
+-- noise swamped it) or the two axes are too close to call (ambiguous diagonal).
+-- Caller retries / falls back to legacy heading on nil.
+function gps2.headingBetween(a, b)
+  if type(a) ~= "table" or type(b) ~= "table" then return nil end
+  local dx, dz = b.x - a.x, b.z - a.z
+  local ax, az = math.abs(dx), math.abs(dz)
+  if math.max(ax, az) < 0.5 then return nil end       -- never really moved
+  if math.abs(ax - az) < 0.5 then return nil end       -- diagonal: no clear axis
+  if ax >= az then return dx > 0 and 0 or 2 end
+  return dz > 0 and 1 or 3
+end
+
+-- orchestrate the two-fix heading survey. moveFwd/moveBack are caller-supplied
+-- callbacks that move the turtle exactly one block forward / back, returning truthy
+-- on success. Returns origin{x,y,z}, heading(0..3) or nil, err -- the latter on any
+-- failed fix, failed move, or degenerate heading, after a best-effort move back.
+function gps2.calibrate(moveFwd, moveBack)
+  local origin, err = gps2.locate()
+  if not origin then return nil, "origin fix failed: " .. tostring(err) end
+  if not moveFwd() then return nil, "calibration: move forward failed" end
+  local p2, err2 = gps2.locate()
+  if not p2 then
+    moveBack()                                        -- best-effort restore
+    return nil, "second fix failed: " .. tostring(err2)
+  end
+  local heading = gps2.headingBetween(origin, p2)
+  if not moveBack() then return nil, "calibration: move back failed" end
+  if heading == nil then return nil, "degenerate heading (fix noise > move?)" end
+  return origin, heading
+end
+
+-- throttled/cached locate for the re-sync loop. Returns the last good fix if it is
+-- newer than maxAge seconds, else attempts a fresh locate() and caches it. Returns
+-- fix{x,y,z} or nil (never errors) so a caller can guard cheaply; maxAge defaults to
+-- 0 (always attempt). Module-level single-slot cache -- a turtle has one gps2.
+local lastFix, lastFixAt = nil, nil
+function gps2.tryFix(maxAge)
+  maxAge = maxAge or 0
+  if lastFix and lastFixAt and (os.clock() - lastFixAt) <= maxAge then
+    return lastFix
+  end
+  local fix = gps2.locate()
+  if fix then
+    lastFix, lastFixAt = fix, os.clock()
+    return fix
+  end
+  return nil
+end
+
 return gps2
