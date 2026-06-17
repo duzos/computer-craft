@@ -29,8 +29,8 @@ local RADIO_FREQ = 1000                 -- fleet radio freq, used for the GPS al
 local MAX_OUT    = 500   -- ceiling for max gas output (lower it if your burners cap below 500)
 local MIN_OUT    = 5     -- burner's minimum settable target
 local HOVER0     = 250   -- hover throttle seed (logs: steady lift ~= 3*throttle, ship weight ~750 -> ~250)
-local V_UP       = 1.0   -- max commanded CLIMB rate (m/s)
-local V_DN       = 0.4   -- max commanded DESCENT rate (m/s) - small; a balloon only cools passively
+local V_UP       = 2.5   -- max commanded CLIMB rate (m/s)
+local V_DN       = 1.0   -- max commanded DESCENT rate (m/s) - balloon descends passively (cooling-limited)
 local K_ALT      = 0.3   -- altitude error -> commanded vspeed (per block); lower = gentler approach
 local KP_V, KI_V = 4, 2   -- vspeed->throttle gains; SLOW given the ~7s response lag; integral tracks hover
 local DOWN_MARGIN = 80   -- MIN throttle band below learned hover (also scales up with hover); stops cut+plummet
