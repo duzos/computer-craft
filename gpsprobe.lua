@@ -1,6 +1,9 @@
 -- gpsprobe.lua  live radio-GPS field-accuracy probe (coloured GUI). Continuously
 -- pings the LIVE gpshost towers (no tower changes, no responder peer -- they reply
--- on the "gps" proto). Two views, toggle with m:
+-- on the "gps" proto).
+--   run:  gpsprobe          interactive GUI (below)
+--         gpsprobe list      one-shot text dump of each tower's pos + stats, then exit
+-- Two views in the GUI, toggle with m:
 --   TABLE  per tower: measured distance, jitter, and -- if you've entered your F3
 --          position -- the error vs true distance, plus the trilaterated fix/error.
 --   MAP    top-down (x/z) minimap: each tower is an id node, you are a '@' node, and
@@ -22,6 +25,10 @@ local PING_EVERY = 0.5     -- seconds between locate pings
 local REDRAW     = 0.3     -- seconds between redraws
 local MAXS       = 16      -- distance samples kept per tower
 local STALE      = 4       -- tower dropped from the view if unheard this long
+local LIST_SECS  = 2.5     -- "gpsprobe list" gather window
+
+local args = { ... }
+local listMode = (args[1] == "list")
 
 comms.open({ freq = RADIO_FREQ, proto = GPS_PROTO })
 if not comms.up() then print("no radio/modem found"); return end
@@ -259,6 +266,42 @@ local function askPos()
   local x, y, z = num("my X"), num("my Y"), num("my Z")
   if x and y and z then mypos = { x = x, y = y, z = z } end
 end
+
+-- one-shot text dump for "gpsprobe list": ping for a couple of seconds, then print
+-- each tower's surveyed pos + measured distance/jitter/sample count and the fix.
+-- Reuses compute() (AVG, partial-tower tolerant) so it shows even 1-3 towers.
+local function runList()
+  ping()
+  local deadline, nextPing = os.clock() + LIST_SECS, os.clock() + PING_EVERY
+  while os.clock() < deadline do
+    local m = comms.receive(GPS_PROTO, 0.3)
+    if m and m.dist and type(m.body) == "table" and m.body.type == "gpsr"
+       and type(m.body.pos) == "table" then
+      record(m.from, m.body.pos, m.dist)
+    end
+    if os.clock() >= nextPing then ping(); nextPing = os.clock() + PING_EVERY end
+  end
+  local towers, _, fix, kind = compute()
+  print(("gps towers heard: %d"):format(#towers))
+  if #towers == 0 then
+    print("  none -- towers down or out of radio range")
+    return
+  end
+  print("id      x     y     z     dist  jit  n")
+  for _, t in ipairs(towers) do
+    print(("#%-4d %5d %5d %5d %6.1f %4.1f %2d"):format(
+      t.id, t.pos.x, t.pos.y, t.pos.z, t.val, t.spread, #hosts[t.id].ds))
+  end
+  if kind == "3D" and fix then
+    print(("fix: %.1f %.1f %.1f (3D)"):format(fix.x, fix.y, fix.z))
+  elseif kind == "2D" and fix then
+    print(("fix: %.1f ?  %.1f (2D x/z, need 4 for 3D)"):format(fix.x, fix.z))
+  else
+    print(("no fix: need 4 towers, have %d"):format(#towers))
+  end
+end
+
+if listMode then runList(); return end
 
 ping()
 local pt = os.startTimer(PING_EVERY)
