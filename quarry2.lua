@@ -2,6 +2,8 @@
 -- DIRECTIONAL: asks at startup whether to mine top->down or bottom->up.
 --   down: clears top to bedrock, then builds the staircase (original behaviour)
 --   up:   digs a corner shaft to bedrock first, then clears upward, then stairs
+-- RESUME: over already-mined ground, full-clears until SKIP_TRIGGER all-air layers, then
+--   fast-traverses (probing inward corner cells) to the first unmined layer. works up & down.
 -- place turtle on the TOP corner of the 16x16; it digs 16 along its facing and 16 to its
 -- right. (Heading is no longer assumed: GPS calibration MEASURES the world heading of that
 -- facing on first boot, so face whichever edge orients the pit and the map still reads true.)
@@ -25,6 +27,7 @@ local LENGTH      = 16
 local FUEL_TARGET = 2000
 local FUEL_MARGIN = 96
 local BUILD_KEEP  = 384         -- cobble kept for stairs (~perimeter) + top cap (WIDTH*LENGTH)
+local SKIP_TRIGGER = 2          -- consecutive all-air layers before fast-traversing mined ground
 local STATE_FILE  = "quarry2.state"
 local CFG_FILE    = "quarry2.cfg"   -- chest names, entered on first boot
 
@@ -76,6 +79,7 @@ local DIR = { [0]={x=1,z=0}, [1]={x=0,z=1}, [2]={x=-1,z=0}, [3]={x=0,z=-1} }
 
 local args = {...}
 local state
+local layerHadBlocks = false           -- per-layer: set when a primary dig hits real material
 local lastResync, lastGpsOk = 0, nil   -- GPS re-sync throttle + last-fix-ok flag (for telem)
 
 local function isKeeper(name)
@@ -118,6 +122,8 @@ local function fresh()
     bottomY = nil,
     resume = nil,
     returnPhase = nil,
+    airStreak = 0,             -- consecutive all-air layers cleared (resume skip trigger)
+    skipping = false,          -- mid fast-traverse over mined ground
   }
 end
 
@@ -155,6 +161,7 @@ local function prepare(detect, dig, inspect, place)
       if isProtected(d.name) then return "protected" end
     end
     if not dig() then return "stop" end
+    layerHadBlocks = true               -- real material on this layer (not the liquid-cap dig below)
     if detect() then return "go" end
   end
   local ok, data = inspect()
@@ -513,9 +520,19 @@ local function requestService(returnPhase)
 end
 
 local function beginLayer()
+  layerHadBlocks = false
   state.xdir = (state.pos.x == 0) and 1 or -1
   state.zdir = (state.pos.z == 0) and 1 or -1
   save()
+end
+
+-- is the current layer unmined? sample only the corner's two INWARD neighbors -- the outward
+-- cells are the pit's natural walls and would false-positive. no moves; any detect -> unmined.
+local function probeUnmined()
+  turnTo(state.xdir == 1 and 0 or 2)
+  if turtle.detect() then return true end
+  turnTo(state.zdir == 1 and 1 or 3)
+  return turtle.detect()
 end
 
 local function stepToNextRow()
@@ -552,6 +569,31 @@ local function clearLayer()
   end
 end
 
+-- fast-traverse already-mined layers: probe the current layer (inward corner cells), and while it
+-- is air step one layer deeper and probe again (Y only, orthogonal to the X/Z GPS snap) until an
+-- unmined layer is found. probe-before-move so the entry layer is never skipped unprobed. honors
+-- clearLayer's safe points. skipping/airStreak persist (not cleared on bedrock/top/service/
+-- recalled) so a reboot or service trip resumes the traverse; only a "found" exits it.
+local function skipToUnmined()
+  state.skipping = true; save()
+  while true do
+    if turtle.getItemCount(14) > 0 then voidJunk() end
+    if needService() then requestService("mine"); return "service" end
+    if checkpoint("mine") then return "recalled" end
+    if probeUnmined() then
+      state.skipping = false; state.airStreak = 0; save()
+      return "found"
+    end
+    if state.dir == "up" then
+      if state.pos.y >= 0 then return "top" end
+      if not up() then return "top" end
+    else
+      if not down() then state.bottomY = state.pos.y; return "bedrock" end
+    end
+    beginLayer(); save()
+  end
+end
+
 local function runDescend()
   while state.phase == "descend" do
     if turtle.getItemCount(14) > 0 then voidJunk() end
@@ -569,6 +611,12 @@ end
 local function runMine()
   if state.xdir == nil then beginLayer() end
   while state.phase == "mine" do
+    if state.skipping or state.airStreak >= SKIP_TRIGGER then
+      local sr = skipToUnmined()
+      if sr == "service" or sr == "recalled" then return end
+      if sr == "bedrock" or sr == "top" then state.phase = "stairs"; save(); return end
+      -- "found": fall through and clear this unmined layer now
+    end
     local r = clearLayer()
     if r == "service" then
       return
@@ -580,6 +628,8 @@ local function runMine()
         state.bottomY = state.pos.y; state.phase = "stairs"; save(); return
       end
     elseif r == "layerdone" then
+      if layerHadBlocks then state.airStreak = 0 else state.airStreak = state.airStreak + 1 end
+      save()
       if checkpoint("mine") then return end
       if state.dir == "up" then
         if state.pos.y >= 0 then state.phase = "stairs"; save(); return end
