@@ -126,8 +126,10 @@ end
 local function setRelay(r, value)
   if r and r.name then pcall(peripheral.call, r.name, "setAnalogOutput", r.side, math.floor(clamp(value, 0, 15) + 0.5)) end
 end
-local function stopHorizontal()
-  setRelay(relays.left, 0); setRelay(relays.right, 0); setRelay(relays.throttle, 15)  -- 15 = full stop
+-- release the horizontal relays (ALL to 0) so the pilot's manual controls take over; the computer only
+-- drives them while actively navigating (where throttle 15 = brake). 0 = silent line, not a stop command.
+local function releaseHorizontal()
+  setRelay(relays.left, 0); setRelay(relays.right, 0); setRelay(relays.throttle, 0)
 end
 
 -- ---------- GPS poller (position + course-over-ground) ----------
@@ -300,13 +302,14 @@ end
 -- returns turnSignal (signed, + = STEER_SIGN's "right"), thrust(0-15 fwd), distHoriz, headingErr
 local function horizStep(target, st)
   if not target.x or not target.z or not st.x or not st.z then
-    setRelay(relays.left, 0); setRelay(relays.right, 0); setRelay(relays.throttle, 15)
+    releaseHorizontal()                                 -- not navigating: hand the horizontal relays to the pilot
     return 0, 0, nil, nil
   end
   local dx, dz = target.x - st.x, target.z - st.z
   local dist = math.sqrt(dx * dx + dz * dz)
   if dist <= ARRIVE_DIST then
-    setRelay(relays.left, 0); setRelay(relays.right, 0); setRelay(relays.throttle, 15)
+    target.x, target.z = nil, nil                       -- arrived: drop the goto (no hunting) + release to pilot
+    releaseHorizontal()
     return 0, 0, dist, 0
   end
   local bearing = math.deg(math.atan2(dz, dx))
@@ -469,8 +472,8 @@ local function controlLoop()
       local gpsLost = (not st.x) or (not gpsAt) or (now - gpsAt) > GPS_LOST_TIMEOUT
       local u, turn, thrust, dist, hErr, vClose = alt.uPrev, 0, 0, nil, nil, nil
       if gpsLost then
-        -- FAILSAFE: GPS gone -> neutralize horizontal (pilot takes over); keep altitude if still possible
-        stopHorizontal()                          -- wheel 0, throttle 15 (full stop; 0 would be full-ahead)
+        -- FAILSAFE: GPS gone -> release horizontal to the pilot (ALL relays 0, incl throttle); keep altitude if possible
+        releaseHorizontal()
         target.x, target.z = nil, nil             -- drop the goto so it can't lurch when GPS returns
         if sensor and st.y then u = altStep(target.y, st, dt, now)   -- altitude hold continues (sensor Y)
         else applyBurner(alt.integ); u = alt.integ end               -- no Y source -> float at learned hover
@@ -515,7 +518,7 @@ end
 
 parallel.waitForAny(controlLoop, gpsLoop)
 
-stopHorizontal()
+releaseHorizontal()
 for _, s in ipairs(BURNER_SIDES) do redstone.setAnalogOutput(s, 0) end
 saveState(); saveNav()
 if logf then logf.close() end
