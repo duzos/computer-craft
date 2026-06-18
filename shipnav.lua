@@ -7,8 +7,9 @@
 -- HORIZONTAL (X/Z): three redstone RELAYS (peripherals), prompted on first boot -> shipnav.cfg:
 --   left / right  -- the wheel; analog 0-15 turns the ship that way
 --   throttle      -- forward drive, INVERTED: 0 = full ahead, 15 = full stop
---   Thrust/drag are SELF-TUNING: it learns this ship's speed-per-thrust and coast (drag) time-constant
---   live and decelerates to arrive without overshoot; persisted to shipnav.state (no hardcoded constants).
+--   Thrust/braking are SELF-TUNING: it learns this ship's speed-per-thrust and the deceleration at
+--   full-stop throttle (relay 15) live, braking early enough to arrive without overshoot; persisted to
+--   shipnav.state (no hardcoded constants).
 -- SENSING: position from the radio-GPS (gps2). Altitude/vspeed from an Avionics altitude_sensor if
 --   present, else GPS Y. Heading: navigation_table (absolute) if present; else a gimbal_sensor's yaw
 --   rate integrated and re-anchored to GPS course (valid even while slow/turning); else raw GPS course.
@@ -50,7 +51,7 @@ local HDG_CORRECT  = 0.05   -- how strongly GPS course re-anchors the gimbal-int
 local TURN_GAIN    = 0.30   -- wheel signal per deg of heading error
 local TURN_DAMP    = 0.30   -- steering yaw-rate damping (signal per deg/s); reduces turn overshoot
 local TURN_DEADBAND = 8     -- deg; inside this, stop steering
-local NAV_STATE    = "shipnav.state"  -- learned horizontal dynamics {thrustK, dragTau}, per ship
+local NAV_STATE    = "shipnav.state"  -- learned horizontal dynamics {thrustK, brakeA}, per ship
 local ARRIVE_DIST  = 3      -- blocks; goal tolerance (a stop radius, not a dynamics constant)
 local CONTROL_DT   = 0.2
 local GPS_PING_EVERY = 0.15
@@ -226,7 +227,7 @@ local function saveState()
 end
 
 -- horizontal dynamics, LEARNED per ship (seeds are first-boot fallbacks only, then overwritten + persisted)
-local nav = { thrustK = 0.5, dragTau = 5.0 }   -- thrustK = steady speed per thrust unit; dragTau = coast time-const (s)
+local nav = { thrustK = 0.5, brakeA = 1.0 }   -- thrustK = steady speed per thrust; brakeA = decel at full-stop throttle (blocks/s^2)
 local prevVh, prevVhT = nil, nil
 local function loadNav()
   if fs.exists(NAV_STATE) then
@@ -235,7 +236,7 @@ local function loadNav()
       local ok, d = pcall(textutils.unserialise, fh.readAll()); fh.close()
       if ok and type(d) == "table" then
         if type(d.thrustK) == "number" then nav.thrustK = clamp(d.thrustK, 0.01, 5) end
-        if type(d.dragTau) == "number" then nav.dragTau = clamp(d.dragTau, 0.3, 60) end
+        if type(d.brakeA) == "number" then nav.brakeA = clamp(d.brakeA, 0.02, 50) end
       end
     end
   end
@@ -248,9 +249,9 @@ local function learnHoriz(thrust, now)
   local vh = math.sqrt((gVx or 0) * (gVx or 0) + (gVz or 0) * (gVz or 0))
   if prevVh and prevVhT and now > prevVhT then
     local a = (vh - prevVh) / (now - prevVhT)
-    if thrust < 1 and vh > 0.6 and a < -0.05 then
-      local tau = -vh / a
-      if tau > 0.3 and tau < 60 then nav.dragTau = nav.dragTau + 0.05 * (tau - nav.dragTau) end
+    if thrust < 1 and vh > 0.6 and a < -0.02 then      -- full-stop throttle (relay 15): learn its deceleration
+      local decel = -a
+      if decel > 0.02 and decel < 50 then nav.brakeA = nav.brakeA + 0.05 * (decel - nav.brakeA) end
     elseif thrust > 3 and vh > 0.6 and math.abs(a) < 0.08 then
       local k = vh / thrust
       if k > 0.01 and k < 5 then nav.thrustK = nav.thrustK + 0.05 * (k - nav.thrustK) end
@@ -316,12 +317,14 @@ local function horizStep(target, st)
   local vClose = (gVx or 0) * ux + (gVz or 0) * uz
   -- decelerate as it approaches: cap the WANTED closing speed by distance so it coasts to a stop,
   -- and only push when below it (throttle is forward-only, so braking = stop pushing + let drag bleed it)
-  -- LEARNED dynamics: top speed = 15*thrustK; coast-stop distance ~= v*dragTau, so the fastest speed
-  -- it can still stop from within dist is dist/dragTau. No hardcoded thrust/drag constants.
+  -- LEARNED dynamics: top speed = 15*thrustK; at full-stop throttle it decelerates at brakeA, so the
+  -- fastest speed it can still brake to a stop within dist is sqrt(2*brakeA*dist). No hardcoded constants.
   local vMax = 15 * nav.thrustK
-  local vWant = math.min(vMax, dist / math.max(nav.dragTau, 0.5))
+  local vSafe = math.sqrt(2 * math.max(nav.brakeA, 0.02) * math.max(dist - ARRIVE_DIST, 0))
+  local vWant = math.min(vMax, vSafe)
   local align = st.heading and math.max(0, math.cos(math.rad(hErr))) or 0
-  local thrust = clamp((2 * vWant - vClose) / math.max(nav.thrustK, 0.01), 0, 15) * align
+  -- push toward vWant; at/above it thrust -> 0, i.e. throttle relay 15 (full stop / brake)
+  local thrust = clamp((vWant - vClose) / math.max(nav.thrustK, 0.01), 0, 15) * align
   if math.abs(hErr) > 60 then thrust = 0 end
   setRelay(relays.throttle, 15 - thrust)        -- inverted: 15 = stop
   return turn, thrust, dist, hErr, vClose
@@ -420,7 +423,7 @@ if not st0.y then local fix = gps2.locate(2, 6); if fix then gx, gy, gz = fix.x,
 local target = { x = nil, y = st0.y and math.floor(st0.y + 0.5) or 64, z = nil }
 
 local logf = fs.open(LOG_FILE, "w")
-if logf then logf.writeLine("t,ysrc,hsrc,x,y,z,tx,ty,tz,heading,yaw,herr,dist,turn,thrust,vclose,thrustK,dragTau,u,hover,lag,vspeed,lift,fill,filltgt") end
+if logf then logf.writeLine("t,ysrc,hsrc,x,y,z,tx,ty,tz,heading,yaw,herr,dist,turn,thrust,vclose,thrustK,brakeA,u,hover,lag,vspeed,lift,fill,filltgt") end
 local lastLog = nil
 local function logRow(st, u, turn, thrust, vClose, dist, hErr, now)
   if not logf then return end
@@ -430,7 +433,7 @@ local function logRow(st, u, turn, thrust, vClose, dist, hErr, now)
   logf.writeLine(table.concat({
     cv(now), st.ysrc or "", st.hsrc or "", cv(st.x), cv(st.y), cv(st.z),
     cv(target.x), cv(target.y), cv(target.z), cv(st.heading), cv(st.yawRate), cv(hErr), cv(dist),
-    cv(turn), cv(thrust), cv(vClose), cv(nav.thrustK), cv(nav.dragTau), cv(u), cv(alt.integ), cv(alt.leadEst), cv(st.vspeed),
+    cv(turn), cv(thrust), cv(vClose), cv(nav.thrustK), cv(nav.brakeA), cv(u), cv(alt.integ), cv(alt.leadEst), cv(st.vspeed),
     cv(callm(b1, "getBalloonLift")), cv(callm(b1, "getBalloonFilledVolume")), cv(callm(b1, "getBalloonTargetVolume")),
   }, ","))
   logf.flush()
