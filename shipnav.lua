@@ -137,6 +137,12 @@ local gx, gy, gz, gVspeed, gpsAt, gCourse, gVx, gVz = nil, nil, nil, nil, nil, n
 local gpsTowers = nil   -- last-seen towers, for the map
 local fusedHdg, fusedHdgT = nil, nil   -- gimbal yaw-rate integrated heading, re-anchored to GPS course
 local prevHdg, prevHdgT, yawDeriv = nil, nil, nil   -- for deriving yaw rate when there is no gimbal
+local manual, altHold = false, true   -- manual = pilot has horizontal control; altHold = keep holding Y while manual
+local function toggleManual()
+  manual = not manual
+  if not manual then altHold = true end   -- resuming auto: altitude is always held
+end
+local function toggleAlt() altHold = not altHold end
 local function gpsLoop()
   local towers, yhist, lastPing = {}, {}, -1e9
   local cX, cZ, cT = nil, nil, nil
@@ -298,6 +304,16 @@ local function altStep(targetY, st, dt, now)
   return u, sig, tgt, err, desiredV
 end
 
+-- altitude per the ALT HOLD toggle: hold targetY (or float at hover with no Y), or release the burners to the pilot
+local function doAltitude(targetY, st, dt, now)
+  if not altHold then
+    for _, s in ipairs(BURNER_SIDES) do redstone.setAnalogOutput(s, 0) end   -- release burner redstone; pilot flies altitude
+    return 0
+  end
+  if st.y then return altStep(targetY, st, dt, now) end
+  applyBurner(alt.integ); return alt.integ                                   -- no Y (e.g. GPS lost + no sensor) -> float
+end
+
 -- ---------- horizontal control ----------
 -- returns turnSignal (signed, + = STEER_SIGN's "right"), thrust(0-15 fwd), distHoriz, headingErr
 local function horizStep(target, st)
@@ -362,8 +378,10 @@ local function render(mon, st, target, u, dist, hErr, thrust, lost)
   dev.setBackgroundColor(colors.black); dev.setTextColor(colors.white); dev.clear()
   buttons = {}
 
+  local inControl = manual or lost
   local status, scol = "IDLE", colors.lightGray
   if lost then status, scol = "GPS LOST", colors.red
+  elseif manual then status, scol = "PILOT", colors.orange
   elseif target.x then
     if dist and dist <= ARRIVE_DIST then status, scol = "ARRIVED", colors.lime
     else status, scol = "GOTO", colors.yellow end
@@ -373,10 +391,12 @@ local function render(mon, st, target, u, dist, hErr, thrust, lost)
   at(dev, math.max(12, w - #status), 1, status, scol, colors.blue)
 
   local hd = st.heading and ("%d"):format((math.floor(st.heading + 360.5)) % 360) or "-"
-  if lost then
-    at(dev, 1, 2, "GPS LOST - PILOT HAS CONTROL", colors.red)
-    at(dev, 1, 3, sensor and "altitude HELD (sensor)" or "NO ALT SENSOR - float @hover",
-       sensor and colors.lime or colors.orange)
+  if inControl then
+    at(dev, 1, 2, lost and "GPS LOST - PILOT HAS CONTROL" or "PILOT CONTROL  (tap map to resume)",
+       lost and colors.red or colors.orange)
+    local altmsg = (not altHold) and "alt: MANUAL (burners released)"
+      or (st.y and "alt: HELD" or "alt: float @hover (no Y)")
+    at(dev, 1, 3, altmsg, altHold and colors.lime or colors.orange)
   else
     at(dev, 1, 2, ("tgt %s,%s,%s"):format(fmt(target.x), fmt(target.y), fmt(target.z)), colors.cyan)
     at(dev, 1, 3, ("pos %s,%s,%s"):format(fmt(st.x), fmt(st.y), fmt(st.z)), colors.lightGray)
@@ -418,11 +438,12 @@ local function render(mon, st, target, u, dist, hErr, thrust, lost)
   end
   btn("Y-", function() target.y = (target.y or 0) - 5 end, colors.orange)
   btn("Y+", function() target.y = (target.y or 0) + 5 end, colors.green)
-  btn("STOP", function() target.x, target.z = nil, nil end, colors.red)
+  btn(manual and "AUTO" or "PILOT", toggleManual, manual and colors.lime or colors.red)
+  if inControl then btn(altHold and "ALT:ON" or "ALT:OFF", toggleAlt, altHold and colors.lime or colors.orange) end
   btn("-", function() map.zoom(vp, 1 / 1.5) end, colors.gray)
   btn("+", function() map.zoom(vp, 1.5) end, colors.gray)
   btn("F", followToggle, vp.follow and colors.lime or colors.gray)
-  at(dev, bx, h, mon and "tap=goto" or "s=stop i/o=zm f q", colors.gray)
+  at(dev, bx, h, mon and "tap=goto" or "m=man h=alt i/o=zm f q", colors.gray)
 end
 
 -- ---------- main ----------
@@ -470,13 +491,11 @@ local function controlLoop()
       lastTick = now
       local st = readState()
       local gpsLost = (not st.x) or (not gpsAt) or (now - gpsAt) > GPS_LOST_TIMEOUT
+      if gpsLost then manual = true; target.x, target.z = nil, nil end  -- GPS loss forces pilot control + drops the goto
       local u, turn, thrust, dist, hErr, vClose = alt.uPrev, 0, 0, nil, nil, nil
-      if gpsLost then
-        -- FAILSAFE: GPS gone -> release horizontal to the pilot (ALL relays 0, incl throttle); keep altitude if possible
-        releaseHorizontal()
-        target.x, target.z = nil, nil             -- drop the goto so it can't lurch when GPS returns
-        if sensor and st.y then u = altStep(target.y, st, dt, now)   -- altitude hold continues (sensor Y)
-        else applyBurner(alt.integ); u = alt.integ end               -- no Y source -> float at learned hover
+      if manual then
+        releaseHorizontal()                       -- pilot has horizontal control; altitude per the ALT HOLD toggle
+        u = doAltitude(target.y, st, dt, now)
       else
         u = altStep(target.y, st, dt, now)
         turn, thrust, dist, hErr, vClose = horizStep(target, st)
@@ -501,7 +520,8 @@ local function controlLoop()
       elseif ev[2] == "o" then map.zoom(vp, 1 / 1.5)    -- zoom out
       elseif ev[2] == "f" then followToggle()
       elseif ev[2] == "g" then vp.follow = false; map.fit(vp)
-      elseif ev[2] == "s" then target.x, target.z = nil, nil
+      elseif ev[2] == "m" then toggleManual()
+      elseif ev[2] == "h" then toggleAlt()
       elseif ev[2] == "q" then break end
     elseif e == "monitor_touch" then
       local tx, ty = ev[3], ev[4]
@@ -511,6 +531,7 @@ local function controlLoop()
       end
       if not hit and mapProj and map.inBox(mapProj, tx, ty) then
         target.x, target.z = map.screenToWorld(mapProj, tx, ty)   -- tap the map to set the X/Z goto
+        manual = false; altHold = true                            -- ...and resume autopilot (altitude held)
       end
     end
   end
