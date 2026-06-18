@@ -53,6 +53,7 @@ local TURN_DAMP    = 0.30   -- steering yaw-rate damping (signal per deg/s); red
 local TURN_DEADBAND = 8     -- deg; inside this, stop steering
 local NAV_STATE    = "shipnav.state"  -- learned horizontal dynamics {thrustK, brakeA}, per ship
 local ARRIVE_DIST  = 3      -- blocks; goal tolerance (a stop radius, not a dynamics constant)
+local GPS_LOST_TIMEOUT = 3  -- s without a GPS fix -> failsafe: stop horizontal, hand control to the pilot
 local CONTROL_DT   = 0.2
 local GPS_PING_EVERY = 0.15
 local GPS_AVG      = 1.2
@@ -339,14 +340,15 @@ local function arrowFor(h)
   return ({ [0] = ">", [1] = "\\", [2] = "v", [3] = "/", [4] = "<", [5] = "\\", [6] = "^", [7] = "/" })[oct]
 end
 
-local function render(mon, st, target, u, dist, hErr, thrust)
+local function render(mon, st, target, u, dist, hErr, thrust, lost)
   local dev = mon or term
   local w, h = dev.getSize()
   dev.setBackgroundColor(colors.black); dev.setTextColor(colors.white); dev.clear()
   buttons = {}
 
   local status, scol = "IDLE", colors.lightGray
-  if target.x then
+  if lost then status, scol = "GPS LOST", colors.red
+  elseif target.x then
     if dist and dist <= ARRIVE_DIST then status, scol = "ARRIVED", colors.lime
     else status, scol = "GOTO", colors.yellow end
   end
@@ -354,9 +356,15 @@ local function render(mon, st, target, u, dist, hErr, thrust)
   at(dev, 1, 1, "SHIP NAV", colors.white, colors.blue)
   at(dev, math.max(12, w - #status), 1, status, scol, colors.blue)
 
-  at(dev, 1, 2, ("tgt %s,%s,%s"):format(fmt(target.x), fmt(target.y), fmt(target.z)), colors.cyan)
   local hd = st.heading and ("%d"):format((math.floor(st.heading + 360.5)) % 360) or "-"
-  at(dev, 1, 3, ("pos %s,%s,%s"):format(fmt(st.x), fmt(st.y), fmt(st.z)), colors.lightGray)
+  if lost then
+    at(dev, 1, 2, "GPS LOST - PILOT HAS CONTROL", colors.red)
+    at(dev, 1, 3, sensor and "altitude HELD (sensor)" or "NO ALT SENSOR - float @hover",
+       sensor and colors.lime or colors.orange)
+  else
+    at(dev, 1, 2, ("tgt %s,%s,%s"):format(fmt(target.x), fmt(target.y), fmt(target.z)), colors.cyan)
+    at(dev, 1, 3, ("pos %s,%s,%s"):format(fmt(st.x), fmt(st.y), fmt(st.z)), colors.lightGray)
+  end
   at(dev, 1, 4, ("hdg %s%s  dist %s  thr %d"):format(hd, st.hsrc and (" " .. st.hsrc) or "",
      dist and ("%.0f"):format(dist) or "-", math.floor((thrust or 0) + 0.5)), colors.lightGray)
 
@@ -449,13 +457,23 @@ local function controlLoop()
       local dt = (lastTick and (now - lastTick)) or CONTROL_DT; if dt <= 0 then dt = CONTROL_DT end
       lastTick = now
       local st = readState()
-      local u = altStep(target.y, st, dt, now)
-      local turn, thrust, dist, hErr, vClose = horizStep(target, st)
-      learnHoriz(thrust, now)
+      local gpsLost = (not st.x) or (not gpsAt) or (now - gpsAt) > GPS_LOST_TIMEOUT
+      local u, turn, thrust, dist, hErr, vClose = alt.uPrev, 0, 0, nil, nil, nil
+      if gpsLost then
+        -- FAILSAFE: GPS gone -> neutralize horizontal (pilot takes over); keep altitude if still possible
+        stopHorizontal()                          -- wheel 0, throttle 15 (full stop; 0 would be full-ahead)
+        target.x, target.z = nil, nil             -- drop the goto so it can't lurch when GPS returns
+        if sensor and st.y then u = altStep(target.y, st, dt, now)   -- altitude hold continues (sensor Y)
+        else applyBurner(alt.integ); u = alt.integ end               -- no Y source -> float at learned hover
+      else
+        u = altStep(target.y, st, dt, now)
+        turn, thrust, dist, hErr, vClose = horizStep(target, st)
+        learnHoriz(thrust, now)
+      end
       if st.x and (not lastTrail or now - lastTrail > 1) then
         trail[#trail + 1] = { x = st.x, z = st.z }; while #trail > 60 do table.remove(trail, 1) end; lastTrail = now
       end
-      render(mon, st, target, u, dist, hErr, thrust)
+      render(mon, st, target, u, dist, hErr, thrust, gpsLost)
       logRow(st, u, turn, thrust, vClose, dist, hErr, now)
       if not lastSave or now - lastSave > 20 then saveState(); saveNav(); lastSave = now end
       timer = os.startTimer(CONTROL_DT)
