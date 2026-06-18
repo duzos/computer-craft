@@ -22,8 +22,10 @@
 --   HEADING_OFFSET (align a nav_table heading to the GPS x/z frame), and the gains below.
 --   "shipnav reset" re-prompts the relays.
 
-local comms = require("comms")
-local gps2  = require("gps2")
+local comms  = require("comms")
+local gps2   = require("gps2")
+local map    = require("map")
+local beacon = require("beacon")
 
 local RADIO_FREQ   = 1000
 local CFG_FILE     = "shipnav.cfg"
@@ -141,9 +143,13 @@ local function gpsLoop()
     if now - lastPing >= GPS_PING_EVERY then comms.send("all", { type = "gpsq" }, "gps"); lastPing = now end
     local m = comms.receive("gps", GPS_PING_EVERY)
     now = os.clock()
-    if m and m.dist and type(m.body) == "table" and m.body.type == "gpsr" and type(m.body.pos) == "table" then
-      local t = towers[m.from]; if not t then t = {}; towers[m.from] = t end
-      t.pos, t.d, t.t = m.body.pos, m.dist, now
+    if m and type(m.body) == "table" then
+      if m.dist and m.body.type == "gpsr" and type(m.body.pos) == "table" then
+        local t = towers[m.from]; if not t then t = {}; towers[m.from] = t end
+        t.pos, t.d, t.t = m.body.pos, m.dist, now
+      elseif m.body.type == "loc" then
+        locTracker.offer(m.from, m.body, m.dist, now)   -- another device's presence beacon
+      end
     end
     local pts = {}
     for _, t in pairs(towers) do
@@ -331,9 +337,16 @@ local function horizStep(target, st)
 end
 
 -- ---------- map + dashboard ----------
-local mapProj = nil   -- {ix1,iy1,ix2,iy2,minX,minZ,offX,offY,scale} for click inversion
+local mapProj = nil   -- last map.draw projection, for tap->world (set target / recentre)
 local buttons = {}
 local trail = {}
+local vp = map.viewport({ auto = true })   -- map viewport: auto-fit until you zoom/follow
+local locTracker = beacon.tracker()        -- other devices heard via loc beacons (e.g. the pad)
+local sendLoc = beacon.sender("ship#" .. os.getComputerID(), "ship")   -- make the ship visible on maps
+-- F: lock the view on the ship; toggling it off returns to fit-everything
+local function followToggle()
+  if vp.follow then vp.follow = false; map.fit(vp) else map.setFollow(vp, true) end
+end
 local function arrowFor(h)
   if not h then return "@" end
   local oct = math.floor(((h + 360) % 360) / 45 + 0.5) % 8
@@ -368,39 +381,32 @@ local function render(mon, st, target, u, dist, hErr, thrust, lost)
   at(dev, 1, 4, ("hdg %s%s  dist %s  thr %d"):format(hd, st.hsrc and (" " .. st.hsrc) or "",
      dist and ("%.0f"):format(dist) or "-", math.floor((thrust or 0) + 0.5)), colors.lightGray)
 
-  -- map box
+  -- map box, rendered by the shared map.lua module: build the marker list (towers,
+  -- other devices' loc beacons, the target, and the ship itself) plus the trail dots,
+  -- then hand them to map.draw with the current viewport. Tap-to-set-target inverts the
+  -- returned projection in the monitor_touch handler.
   local by1, by2 = 6, h - 1
   if by2 - by1 >= 3 then
-    local minX, maxX, minZ, maxZ
-    local function inc(x, z)
-      if not x then return end
-      if not minX then minX, maxX, minZ, maxZ = x, x, z, z
-      else minX, maxX, minZ, maxZ = math.min(minX, x), math.max(maxX, x), math.min(minZ, z), math.max(maxZ, z) end
+    local markers = {}
+    if gpsTowers then
+      for id, t in pairs(gpsTowers) do
+        if t.pos then markers[#markers + 1] = map.marker(t.pos.x, t.pos.z, "#" .. id, "tower", { char = "+", colour = colors.blue }) end
+      end
     end
-    inc(st.x, st.z)
-    if target.x then inc(target.x, target.z) end
-    if gpsTowers then for _, t in pairs(gpsTowers) do if t.pos then inc(t.pos.x, t.pos.z) end end end
-    for _, p in ipairs(trail) do inc(p.x, p.z) end
-    if not minX then minX, maxX, minZ, maxZ = 0, 1, 0, 1 end
-    local spanX, spanZ = math.max(maxX - minX, 8), math.max(maxZ - minZ, 8)
-    local ix1, iy1, ix2, iy2 = 2, by1 + 1, w - 1, by2 - 1
-    for x = 1, w do at(dev, x, by1, "-", colors.gray); at(dev, x, by2, "-", colors.gray) end
-    local mapW, mapH = ix2 - ix1 + 1, iy2 - iy1 + 1
-    local scale = math.min((mapW - 1) / spanX, (mapH - 1) / spanZ); if scale <= 0 then scale = 0.01 end
-    local offX = ix1 + math.floor((mapW - spanX * scale) / 2)
-    local offY = iy1 + math.floor((mapH - spanZ * scale) / 2)
-    local function toCol(x) return offX + math.floor((x - minX) * scale + 0.5) end
-    local function toRow(z) return offY + math.floor((z - minZ) * scale + 0.5) end
-    mapProj = { ix1 = ix1, iy1 = iy1, ix2 = ix2, iy2 = iy2, minX = minX, minZ = minZ, offX = offX, offY = offY, scale = scale }
-    for _, p in ipairs(trail) do local c, r = toCol(p.x), toRow(p.z); if c >= ix1 and c <= ix2 and r >= iy1 and r <= iy2 then at(dev, c, r, ".", colors.gray) end end
-    if gpsTowers then for id, t in pairs(gpsTowers) do if t.pos then local c, r = toCol(t.pos.x), toRow(t.pos.z); if c >= ix1 and c <= ix2 and r >= iy1 and r <= iy2 then at(dev, c, r, "+", colors.blue) end end end end
-    if target.x then local c, r = toCol(target.x), toRow(target.z); if c >= ix1 and c <= ix2 and r >= iy1 and r <= iy2 then at(dev, c, r, "X", colors.red) end end
-    if st.x then local c, r = toCol(st.x), toRow(st.z); if c >= ix1 and c <= ix2 and r >= iy1 and r <= iy2 then at(dev, c, r, arrowFor(st.heading), colors.lime) end end
+    local now = os.clock()
+    for _, r in ipairs(locTracker.list(now)) do
+      if r.id ~= os.getComputerID() then markers[#markers + 1] = map.marker(r.pos.x, r.pos.z, r.label, r.kind) end
+    end
+    if target.x then markers[#markers + 1] = map.marker(target.x, target.z, "tgt", "target", { char = "X" }) end
+    if st.x then markers[#markers + 1] = map.marker(st.x, st.z, "ship", "ship", { char = arrowFor(st.heading), colour = colors.lime, follow = true }) end
+    mapProj = map.draw(dev, markers, vp, {
+      box = { x1 = 1, y1 = by1, x2 = w, y2 = by2 }, border = true, dots = trail,
+    })
   else
     mapProj = nil
   end
 
-  -- bottom buttons: Y nudge + STOP  (tap map = set X/Z)
+  -- bottom buttons: Y nudge + STOP, zoom, follow  (tap map = set X/Z)
   local bx = 1
   local function btn(label, fn, bg)
     at(dev, bx, h, label, colors.black, bg)
@@ -410,7 +416,10 @@ local function render(mon, st, target, u, dist, hErr, thrust, lost)
   btn("Y-", function() target.y = (target.y or 0) - 5 end, colors.orange)
   btn("Y+", function() target.y = (target.y or 0) + 5 end, colors.green)
   btn("STOP", function() target.x, target.z = nil, nil end, colors.red)
-  at(dev, bx, h, mon and "tap map=goto" or "s=stop q=quit", colors.gray)
+  btn("-", function() map.zoom(vp, 1 / 1.5) end, colors.gray)
+  btn("+", function() map.zoom(vp, 1.5) end, colors.gray)
+  btn("F", followToggle, vp.follow and colors.lime or colors.gray)
+  at(dev, bx, h, mon and "tap=goto" or "s=stop i/o=zm f q", colors.gray)
 end
 
 -- ---------- main ----------
@@ -473,6 +482,7 @@ local function controlLoop()
       if st.x and (not lastTrail or now - lastTrail > 1) then
         trail[#trail + 1] = { x = st.x, z = st.z }; while #trail > 60 do table.remove(trail, 1) end; lastTrail = now
       end
+      if st.x then sendLoc(now, { x = st.x, y = st.y, z = st.z }) end   -- presence beacon so the ship shows on other maps
       render(mon, st, target, u, dist, hErr, thrust, gpsLost)
       logRow(st, u, turn, thrust, vClose, dist, hErr, now)
       if not lastSave or now - lastSave > 20 then saveState(); saveNav(); lastSave = now end
@@ -484,6 +494,10 @@ local function controlLoop()
     elseif e == "char" then
       if ev[2] == "+" or ev[2] == "=" then target.y = target.y + 1
       elseif ev[2] == "-" then target.y = target.y - 1
+      elseif ev[2] == "i" then map.zoom(vp, 1.5)        -- zoom in (map only; +/- nudge target Y)
+      elseif ev[2] == "o" then map.zoom(vp, 1 / 1.5)    -- zoom out
+      elseif ev[2] == "f" then followToggle()
+      elseif ev[2] == "g" then vp.follow = false; map.fit(vp)
       elseif ev[2] == "s" then target.x, target.z = nil, nil
       elseif ev[2] == "q" then break end
     elseif e == "monitor_touch" then
@@ -492,9 +506,8 @@ local function controlLoop()
       for _, b in ipairs(buttons) do
         if ty == b.y and tx >= b.x1 and tx <= b.x2 then b.fn(); hit = true; break end
       end
-      if not hit and mapProj and tx >= mapProj.ix1 and tx <= mapProj.ix2 and ty >= mapProj.iy1 and ty <= mapProj.iy2 then
-        target.x = mapProj.minX + (tx - mapProj.offX) / mapProj.scale
-        target.z = mapProj.minZ + (ty - mapProj.offY) / mapProj.scale
+      if not hit and mapProj and map.inBox(mapProj, tx, ty) then
+        target.x, target.z = map.screenToWorld(mapProj, tx, ty)   -- tap the map to set the X/Z goto
       end
     end
   end

@@ -17,8 +17,10 @@
 -- LIVE mode uses only the latest ping per tower so the fix tracks you as you move.
 -- keys: m = table/map   p = set my F3 pos   l = AVG/LIVE   r = clear samples   q = quit
 
-local comms = require("comms")
-local gps2  = require("gps2")
+local comms  = require("comms")
+local gps2   = require("gps2")
+local map    = require("map")
+local beacon = require("beacon")
 
 local GPS_PROTO  = "gps"
 local RADIO_FREQ = 1000
@@ -39,6 +41,11 @@ local mypos = nil          -- your actual F3 position, for the error columns
 local live  = false        -- LIVE = latest ping only (tracks movement); AVG = windowed
 local view  = "table"      -- "table" | "map"
 local hosts = {}           -- id -> { pos, ds = {recent dists}, last }
+local vp     = map.viewport({ auto = true })          -- map viewport: auto-fit until you zoom/pan
+local locs   = beacon.tracker()                       -- other devices heard via loc beacons
+local mapProj = nil                                   -- last map projection, for click->world
+local sendLoc = beacon.sender("probe#" .. os.getComputerID(), "probe")  -- make this probe visible
+local function panStep() return 5 / math.max(vp.scale or 1, 0.001) end
 
 local function ping() comms.send("all", { type = "gpsq" }, GPS_PROTO) end
 
@@ -170,14 +177,17 @@ local function drawTable()
   at(1, H, "m=map p=pos l=live r=clr q", colors.gray)
 end
 
+-- top-down minimap, now rendered by the shared map.lua module: gpsprobe just builds
+-- the marker list (towers + you + any loc beacons heard) and the range rings, then
+-- hands them to map.draw with the current viewport. zoom/pan/follow live in vp.
 local function drawMap()
   term.setBackgroundColor(colors.black); term.clear()
   local towers, pts, fix = compute()
 
   strip(1, colors.blue)
   atc(2, 1, "MINIMAP", colors.white, colors.blue)
-  local mode = live and "LIVE" or "AVG"
-  atc(W - #mode, 1, mode, colors.white, colors.blue)
+  local modeTag = (live and "LIVE" or "AVG") .. (vp.follow and " FOL" or (vp.auto and " FIT" or ""))
+  atc(W - #modeTag, 1, modeTag, colors.white, colors.blue)
 
   if #towers == 0 then
     at(2, 3, "no towers heard", colors.gray)
@@ -185,76 +195,42 @@ local function drawMap()
     return
   end
 
+  -- self fix: exact (3D/2D) or rough 2D, falling back to an entered pos
   local me, approx = fix, false
   if not me and #towers >= 3 then me = gps2.trilaterate2d(pts, mypos and mypos.y or nil); approx = not mypos end
   if not me then me, approx = mypos, true end
   local pcol = approx and colors.yellow or colors.lime
-  local minX, maxX, minZ, maxZ = towers[1].pos.x, towers[1].pos.x, towers[1].pos.z, towers[1].pos.z
-  local function inc(x, z)
-    if x < minX then minX = x end
-    if x > maxX then maxX = x end
-    if z < minZ then minZ = z end
-    if z > maxZ then maxZ = z end
-  end
-  for _, t in ipairs(towers) do inc(t.pos.x, t.pos.z) end
-  if me then inc(me.x, me.z) end
-  if mypos then inc(mypos.x, mypos.z) end
-  local spanX, spanZ = math.max(maxX - minX, 1), math.max(maxZ - minZ, 1)
 
-  at(1, 2, ("n%d  %dx%dm"):format(#towers, spanX, spanZ), ncolour(#towers))
+  -- markers: each tower (its id as the glyph), other devices' loc beacons, then you
+  local markers, rings = {}, {}
+  for _, t in ipairs(towers) do
+    markers[#markers + 1] = map.marker(t.pos.x, t.pos.z, "#" .. t.id, "tower", { char = tostring(t.id) })
+    rings[#rings + 1] = { x = t.pos.x, z = t.pos.z, r = t.val, colour = colors.gray }
+  end
+  local now = os.clock()
+  for _, r in ipairs(locs.list(now)) do
+    if r.id ~= os.getComputerID() then markers[#markers + 1] = map.marker(r.pos.x, r.pos.z, r.label, r.kind) end
+  end
+  if mypos and me ~= mypos then
+    markers[#markers + 1] = map.marker(mypos.x, mypos.z, "pos", nil, { char = "+", colour = colors.lightGray })
+  end
+  if me then
+    markers[#markers + 1] = map.marker(me.x, me.z, "you", "self", { char = "@", colour = pcol, follow = true })
+  end
+
+  at(1, 2, ("n%d  x%.2f"):format(#towers, vp.scale or 0), ncolour(#towers))
   if me then
     local r = ("@ %.0f,%.0f"):format(me.x, me.z)
     at(W - #r + 1, 2, r, pcol)
   end
 
-  local bx1, by1, bx2, by2 = 1, 3, W, H - 2
-  for x = bx1, bx2 do at(x, by1, "-", colors.gray); at(x, by2, "-", colors.gray) end
-  for yy = by1 + 1, by2 - 1 do at(bx1, yy, "|", colors.gray); at(bx2, yy, "|", colors.gray) end
-  at(bx1, by1, "+", colors.gray); at(bx2, by1, "+", colors.gray)
-  at(bx1, by2, "+", colors.gray); at(bx2, by2, "+", colors.gray)
-
-  local ix1, iy1, ix2, iy2 = bx1 + 1, by1 + 1, bx2 - 1, by2 - 1
-  local mapW, mapH = ix2 - ix1 + 1, iy2 - iy1 + 1
-  local scale = math.min((mapW - 1) / spanX, (mapH - 1) / spanZ)
-  if scale <= 0 then scale = 0.01 end
-  local offX = ix1 + math.floor((mapW - spanX * scale) / 2)
-  local offY = iy1 + math.floor((mapH - spanZ * scale) / 2)
-  local function toCol(x) return offX + math.floor((x - minX) * scale + 0.5) end
-  local function toRow(z) return offY + math.floor((z - minZ) * scale + 0.5) end
-  local function inside(c, r) return c >= ix1 and c <= ix2 and r >= iy1 and r <= iy2 end
-
-  -- faint range rings (cross at your position)
-  for _, t in ipairs(towers) do
-    local rc = t.val * scale
-    if rc >= 1 then
-      local step = math.max(0.04, 1 / rc)
-      local a = 0
-      while a < 6.2832 do
-        local c, r = toCol(t.pos.x + t.val * math.cos(a)), toRow(t.pos.z + t.val * math.sin(a))
-        if inside(c, r) then at(c, r, ".", colors.gray) end
-        a = a + step
-      end
-    end
-  end
-
-  for _, t in ipairs(towers) do
-    local c, r = toCol(t.pos.x), toRow(t.pos.z)
-    if inside(c, r) then at(c, r, tostring(t.id), colors.cyan) end
-  end
-  if mypos and me ~= mypos then
-    local c, r = toCol(mypos.x), toRow(mypos.z)
-    if inside(c, r) then at(c, r, "+", colors.lightGray) end
-  end
-  if me then
-    local c, r = toCol(me.x), toRow(me.z)
-    if inside(c, r) then at(c, r, "@", pcol) end
-  else
-    at(ix1 + 1, iy1 + 1, "need 3+ towers or press p", colors.gray)
-  end
+  mapProj = map.draw(term, markers, vp, {
+    box = { x1 = 1, y1 = 3, x2 = W, y2 = H - 2 }, border = true, rings = rings,
+  })
 
   at(1, H - 1, "#", colors.cyan); at(3, H - 1, "tower", colors.lightGray)
   at(11, H - 1, "@", colors.lime); at(13, H - 1, "you", colors.lightGray)
-  at(1, H, "m=table p=pos l=live q", colors.gray)
+  at(1, H, "m +/-zoom arrows f=fol g=fit q", colors.gray)
 end
 
 local function draw()
@@ -322,22 +298,43 @@ while true do
   local k = ev[1]
   if k == "terminate" then break
   elseif k == "timer" then
-    if ev[2] == pt then ping(); pt = os.startTimer(PING_EVERY)
+    if ev[2] == pt then
+      ping()
+      local _, _, f = compute(); if f then sendLoc(os.clock(), f) end   -- beacon our fix to other maps
+      pt = os.startTimer(PING_EVERY)
     elseif ev[2] == dt then draw(); dt = os.startTimer(REDRAW) end
   elseif k == "char" then
     if ev[2] == "q" then break
     elseif ev[2] == "r" then hosts = {}; draw()
     elseif ev[2] == "l" then live = not live; draw()
     elseif ev[2] == "m" then view = (view == "map") and "table" or "map"; draw()
+    elseif ev[2] == "f" then map.setFollow(vp, not vp.follow); draw()
+    elseif ev[2] == "g" then vp.follow = false; map.fit(vp); draw()
+    elseif ev[2] == "+" or ev[2] == "=" then map.zoom(vp, 1.5); draw()
+    elseif ev[2] == "-" or ev[2] == "_" then map.zoom(vp, 1 / 1.5); draw()
     elseif ev[2] == "p" then
       askPos(); pt = os.startTimer(PING_EVERY); dt = os.startTimer(REDRAW); draw()
+    end
+  elseif k == "key" then
+    if ev[2] == keys.left then map.pan(vp, -panStep(), 0); draw()
+    elseif ev[2] == keys.right then map.pan(vp, panStep(), 0); draw()
+    elseif ev[2] == keys.up then map.pan(vp, 0, -panStep()); draw()
+    elseif ev[2] == keys.down then map.pan(vp, 0, panStep()); draw() end
+  elseif k == "mouse_click" then
+    if view == "map" and mapProj and map.inBox(mapProj, ev[3], ev[4]) then
+      local wx, wz = map.screenToWorld(mapProj, ev[3], ev[4])   -- tap to recentre there
+      map.center(vp, wx, wz); draw()
     end
   elseif k == "radio_message" then
     local raw, dist = ev[3], ev[4]
     if type(raw) == "string" then local ok, d = pcall(textutils.unserialise, raw); if ok then raw = d end end
     if dist and type(raw) == "table" and raw.__c and raw.proto == GPS_PROTO and raw.from ~= os.getComputerID()
-       and type(raw.body) == "table" and raw.body.type == "gpsr" and type(raw.body.pos) == "table" then
-      record(raw.from, raw.body.pos, dist)
+       and type(raw.body) == "table" then
+      if raw.body.type == "gpsr" and type(raw.body.pos) == "table" then
+        record(raw.from, raw.body.pos, dist)
+      elseif raw.body.type == "loc" then
+        locs.offer(raw.from, raw.body, dist, os.clock())
+      end
     end
   end
 end
