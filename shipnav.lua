@@ -48,7 +48,7 @@ local STEER_SIGN   = 1      -- flip to -1 if the wheel turns the wrong way
 local HEADING_OFFSET = 0    -- deg added to a nav_table heading to match the GPS x/z frame
 local GYRO_SIGN    = 1      -- gimbal yaw-rate polarity (flip if the fused heading spins the wrong way)
 local HDG_CORRECT  = 0.05   -- how strongly GPS course re-anchors the gimbal-integrated heading (0..1)
-local TURN_GAIN    = 0.30   -- wheel signal per deg of heading error
+local TURN_GAIN    = 0.10   -- wheel signal per deg of heading error (proven gentle value)
 local TURN_DAMP    = 0.30   -- steering yaw-rate damping (signal per deg/s); reduces turn overshoot
 local TURN_DEADBAND = 8     -- deg; inside this, stop steering
 local NAV_STATE    = "shipnav.state"  -- learned horizontal dynamics {thrustK, brakeA}, per ship
@@ -304,9 +304,8 @@ local function horizStep(target, st)
   end
   local bearing = math.deg(math.atan2(dz, dx))
   local hErr = st.heading and wrap180(bearing - st.heading) or 0
-  -- gimbal is OPTIONAL: with no yaw-rate damping available, use a gentler P gain so steering stays stable
-  local kp = gimbal and TURN_GAIN or TURN_GAIN * 0.5
-  local turn = clamp(kp * hErr - TURN_DAMP * (st.yawRate or 0), -15, 15) * STEER_SIGN
+  -- gimbal is OPTIONAL and strictly additive: it only ADDS yaw-rate damping; the P gain is unchanged
+  local turn = clamp(TURN_GAIN * hErr - TURN_DAMP * (st.yawRate or 0), -15, 15) * STEER_SIGN
   if not st.heading or math.abs(hErr) < TURN_DEADBAND then turn = 0 end
   if turn > 0 then setRelay(relays.right, turn); setRelay(relays.left, 0)
   elseif turn < 0 then setRelay(relays.left, -turn); setRelay(relays.right, 0)
