@@ -47,7 +47,8 @@ local BURNER_SIDES = { "left", "right" } -- computer faces feeding the burners' 
 
 -- horizontal control
 local STEER_SIGN   = 1      -- flip to -1 if the wheel turns the wrong way
-local HEADING_OFFSET = 0    -- deg added to a nav_table heading to match the GPS x/z frame
+local HEADING_SIGN = -1     -- nav_table heading polarity: its frame is mirrored vs ours (atan2 dz,dx); flip to +1 if a turn reads backwards
+local HEADING_OFFSET = 0    -- deg trim added to the nav_table heading after the sign, if a constant offset remains
 local GYRO_SIGN    = 1      -- gimbal yaw-rate polarity (flip if the fused heading spins the wrong way)
 local HDG_CORRECT  = 0.05   -- how strongly GPS course re-anchors the gimbal-integrated heading (0..1)
 local TURN_GAIN    = 0.10   -- wheel signal per deg of heading error (proven gentle value)
@@ -206,7 +207,7 @@ local function readState()
     if type(rates) == "table" and type(rates.wy) == "number" then yawRate = GYRO_SIGN * rates.wy end
   end
   if navtab then
-    local nh = callm(navtab, "getHeading"); if type(nh) == "number" then heading, hsrc = wrap180(nh + HEADING_OFFSET), "nav" end
+    local nh = callm(navtab, "getHeading"); if type(nh) == "number" then heading, hsrc = wrap180(HEADING_SIGN * nh + HEADING_OFFSET), "nav" end
   end
   if heading == nil and yawRate then
     -- integrate the gimbal yaw rate; re-anchor to GPS course when moving fast enough to trust it
@@ -390,7 +391,7 @@ local function render(mon, st, target, u, dist, hErr, thrust, lost)
   at(dev, 1, 1, "SHIP NAV", colors.white, colors.blue)
   at(dev, math.max(12, w - #status), 1, status, scol, colors.blue)
 
-  local hd = st.heading and ("%d"):format((math.floor(st.heading + 360.5)) % 360) or "-"
+  local hd = st.heading and ("%d"):format(math.floor(((st.heading + 90) % 360) + 0.5) % 360) or "-"  -- compass: N=0 E=90 S=180 W=270
   if inControl then
     at(dev, 1, 2, lost and "GPS LOST - PILOT HAS CONTROL" or "PILOT CONTROL  (tap map to resume)",
        lost and colors.red or colors.orange)
