@@ -12,7 +12,8 @@
 -- SENSING: position from the radio-GPS (gps2). Altitude/vspeed from an Avionics altitude_sensor if
 --   present, else GPS Y. Heading: navigation_table (absolute) if present; else a gimbal_sensor's yaw
 --   rate integrated and re-anchored to GPS course (valid even while slow/turning); else raw GPS course.
---   A gimbal also damps the steering (yaw rate). GPS is the full fallback; Create peripherals used when found.
+--   Yaw rate damps the steering - from the gimbal if present, else derived from the heading's own change.
+--   None of the Create peripherals are required: it runs fully on GPS alone, they just sharpen it.
 -- UI (advanced monitor, else terminal): top-down map - TAP to set the X/Z target - with the ship
 --   (heading arrow), target, towers and a trail; target X/Y/Z + heading + distance readout; buttons to
 --   nudge Y and STOP. Keys: arrows / +/- nudge target Y, s = stop horizontal, q = quit.
@@ -129,6 +130,7 @@ end
 local gx, gy, gz, gVspeed, gpsAt, gCourse, gVx, gVz = nil, nil, nil, nil, nil, nil, nil, nil
 local gpsTowers = nil   -- last-seen towers, for the map
 local fusedHdg, fusedHdgT = nil, nil   -- gimbal yaw-rate integrated heading, re-anchored to GPS course
+local prevHdg, prevHdgT, yawDeriv = nil, nil, nil   -- for deriving yaw rate when there is no gimbal
 local function gpsLoop()
   local towers, yhist, lastPing = {}, {}, -1e9
   local cX, cZ, cT = nil, nil, nil
@@ -301,7 +303,9 @@ local function horizStep(target, st)
   end
   local bearing = math.deg(math.atan2(dz, dx))
   local hErr = st.heading and wrap180(bearing - st.heading) or 0
-  local turn = clamp(TURN_GAIN * hErr - TURN_DAMP * (st.yawRate or 0), -15, 15) * STEER_SIGN
+  -- gimbal is OPTIONAL: with no yaw-rate damping available, use a gentler P gain so steering stays stable
+  local kp = gimbal and TURN_GAIN or TURN_GAIN * 0.5
+  local turn = clamp(kp * hErr - TURN_DAMP * (st.yawRate or 0), -15, 15) * STEER_SIGN
   if not st.heading or math.abs(hErr) < TURN_DEADBAND then turn = 0 end
   if turn > 0 then setRelay(relays.right, turn); setRelay(relays.left, 0)
   elseif turn < 0 then setRelay(relays.left, -turn); setRelay(relays.right, 0)
