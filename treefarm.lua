@@ -128,7 +128,10 @@ local function checkin(phase)
     pct = 0, halted = state.halted, pos = { x = pos.x, y = pos.y, z = pos.z }, head = head, gps = gpsFlag,
     harvests = state.harvests or 0, logs = state.lastLogs or 0,
   }, STORE_PROTOCOL)
-  if state.gps and state.origin then sendLoc(os.clock(), pos) end   -- presence beacon -> fleet maps
+  -- presence beacon -> fleet maps: calibrated = free dead-reckoned world pos; uncalibrated =
+  -- a direct GPS fix (cached ~10s) so a legacy turtle still appears without a dock reset
+  if state.gps and state.origin then sendLoc(os.clock(), pos)
+  else local fx = gps2.tryFix(10); if fx then sendLoc(os.clock(), fx) end end
   local r = comms.receive(STORE_PROTOCOL, 0.3)
   local body = r and r.body
   rebootIfAsked(body)
