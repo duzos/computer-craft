@@ -129,6 +129,17 @@ local monStore = {}          -- monitor name -> { sel, scroll, amt, dest, sortMo
 local fleetSeen = beacon.tracker()                          -- loc beacons heard, for the fleet map page
 local fleetVp = map.viewport({ auto = true, aspect = map.SQUARE_ASPECT })  -- square, zoomed to fit all
 local corePos = nil          -- this store's own location (CORE), read once from gpshost.state
+-- the store is itself the CORE, but comms drops our own beacon (self-echo guard), so we read
+-- CORE from the co-hosted gpshost's surveyed position on disk rather than from a beacon.
+local function coreLoad()
+  if corePos ~= nil then return corePos or nil end
+  corePos = false
+  if fs.exists("gpshost.state") then
+    local f = fs.open("gpshost.state", "r"); local t = textutils.unserialize(f.readAll()); f.close()
+    if type(t) == "table" and type(t.x) == "number" and type(t.z) == "number" then corePos = t end
+  end
+  return corePos or nil
+end
 local STORE_AMOUNTS = { 1, 8, 16, 32, 64 }
 local STORE_SORTS = {                  -- index 1 is the default; a-z first
   { key = "a-z", cmp = function(a, b) return (a.id:match("[^:]+$") or a.id) < (b.id:match("[^:]+$") or b.id) end },
@@ -1108,6 +1119,16 @@ local function handle(line, reply, origin)
     end
     table.sort(arr, function(a, b) return (a.label or tostring(a.id)) < (b.label or tostring(b.id)) end)
     reply(textutils.serialize(arr))
+  elseif cmd == "locs" then
+    -- aggregated fleet positions for thin map clients (pad / fleetmap): the store hears every
+    -- beacon via its tower, so handhelds pull this instead of trying to hear turtles directly.
+    local arr = {}
+    local cp = coreLoad()
+    if cp then arr[#arr + 1] = { id = "core", label = "CORE", kind = "core", pos = cp } end
+    for _, r in ipairs(fleetSeen.list(os.clock())) do
+      arr[#arr + 1] = { id = r.id, label = r.label, kind = r.kind, pos = r.pos }
+    end
+    reply(textutils.serialize(arr))
   elseif cmd == "mons" or cmd == "mon" then
     if args[2] then
       local target = args[2]
@@ -1593,18 +1614,6 @@ local function drawStore(mon)
 end
 
 ----------------------------------------------------------------- fleet map page
--- the store is itself the CORE, but comms drops our own beacon (self-echo guard), so we plot
--- CORE from the co-hosted gpshost's surveyed position on disk rather than from a beacon.
-local function coreLoad()
-  if corePos ~= nil then return corePos or nil end
-  corePos = false
-  if fs.exists("gpshost.state") then
-    local f = fs.open("gpshost.state", "r"); local t = textutils.unserialize(f.readAll()); f.close()
-    if type(t) == "table" and type(t.x) == "number" and type(t.z) == "number" then corePos = t end
-  end
-  return corePos or nil
-end
-
 -- top-down fleet map on a monitor: CORE + every loc beacon (ship/turtles/pad/probe), auto-fit
 -- to a square zoomed to show all. Non-interactive (auto-fit), so it clears its touch region.
 local function drawFleet(mon)

@@ -359,18 +359,20 @@ local fmSelf = nil                 -- our position (the PAD marker)
 local fmProj, fmTimer = nil, nil
 local sendPad = beacon.sender(os.getComputerLabel() or ("pad#" .. os.getComputerID()), "pad")
 local FM_PING, FM_MAXS = 0.6, 8
+local fmStoreList = {}             -- aggregated fleet from the store (it hears everyone via its tower)
+local fmLastLocs = -1e9            -- last time we asked the store for the aggregate
 
 local function fmPing() comms.send("all", { type = "gpsq" }, "gps") end
 
-local function fmDecode(ev)        -- raw transport event -> comms envelope (+ radio dist)
+local function fmDecode(ev)        -- raw transport event -> comms envelope (+ radio dist), any proto
   local k = ev[1]
   if k == "radio_message" then
     local raw, dist = ev[3], ev[4]
     if type(raw) == "string" then local ok, d = pcall(textutils.unserialise, raw); if ok then raw = d end end
     if type(raw) == "table" and raw.__c then return raw, dist end
   elseif k == "rednet_message" then
-    local msg, p = ev[3], ev[4]
-    if p == "gps" and type(msg) == "table" and msg.__c then return msg, nil end
+    local msg = ev[3]
+    if type(msg) == "table" and msg.__c then return msg, nil end   -- dispatch on env.proto below
   end
   return nil
 end
@@ -384,11 +386,20 @@ local function fmIngest(env, dist)
     while #h.ds > FM_MAXS do table.remove(h.ds, 1) end
     h.last = os.clock()
   elseif b.type == "loc" then
-    fmTracker.offer(env.from, b, dist, os.clock())
+    fmTracker.offer(env.from, b, dist, os.clock())   -- direct beacons: a fallback for nearby devices
   end
 end
 
-local function fmTick()            -- ping towers, refresh our own fix, beacon ourselves
+-- the store's "locs" reply: the whole fleet it has heard (CORE + every beacon), addressed to us
+local function fmStoreReply(env)
+  if env.from == os.getComputerID() or not (env.to == os.getComputerID() or env.to == "all") then return end
+  if type(env.body) == "string" then
+    local ok, arr = pcall(textutils.unserialise, env.body)
+    if ok and type(arr) == "table" then fmStoreList = arr end
+  end
+end
+
+local function fmTick()            -- ping towers for our own fix, beacon ourselves, ask the store
   fmPing()
   local now, pts = os.clock(), {}
   for _, h in pairs(fmHosts) do
@@ -399,19 +410,25 @@ local function fmTick()            -- ping towers, refresh our own fix, beacon o
   end
   if #pts >= 4 then fmSelf = gps2.trilaterate(pts) or fmSelf end
   if fmSelf then sendPad(now, fmSelf) end
+  if now - fmLastLocs >= 2 then comms.send("store", "locs", STORE_PROTOCOL); fmLastLocs = now end
 end
 
 local function fleetRender()
   term.setBackgroundColor(colors.black); term.clear()
   local now = os.clock()
+  -- primary source: the store's aggregate (it hears the whole fleet); fall back to anything we
+  -- heard directly. Merge by id, drop ourselves, then add our own fix as PAD.
+  local byId = {}
+  for _, r in ipairs(fmStoreList) do if r.pos then byId[r.id] = r end end
+  for _, r in ipairs(fmTracker.list(now)) do if not byId[r.id] then byId[r.id] = r end end
   local markers = {}
-  for _, r in ipairs(fmTracker.list(now)) do
-    if r.id ~= os.getComputerID() then markers[#markers + 1] = map.marker(r.pos.x, r.pos.z, r.label, r.kind) end
+  for _, r in pairs(byId) do
+    if r.id ~= os.getComputerID() and r.pos then markers[#markers + 1] = map.marker(r.pos.x, r.pos.z, r.label, r.kind) end
   end
   if fmSelf then markers[#markers + 1] = map.marker(fmSelf.x, fmSelf.z, "PAD", "pad") end
   titleBar("FLEET", #markers .. " seen", colors.lightBlue)
   if #markers == 0 then
-    at(2, 3, fmSelf and "no devices heard yet" or "locating... (need 4 towers)", colors.gray)
+    at(2, 3, fmSelf and "no fleet from store yet" or "locating... (need 4 towers)", colors.gray)
     at(1, H, "x menu   q quit", colors.gray)
     fmProj = nil
     return
@@ -487,7 +504,11 @@ while true do
   elseif e == "timer" then
     if ev[2] == fmTimer and mode == "fleetmap" then fmTick(); render(); fmTimer = os.startTimer(FM_PING) end
   elseif e == "radio_message" or e == "rednet_message" then
-    fmIngest(fmDecode(ev))   -- collect tower fixes + presence beacons for the fleet map
+    local env, dist = fmDecode(ev)
+    if env then
+      if env.proto == "gps" then fmIngest(env, dist)               -- tower fixes + direct beacons
+      elseif env.proto == STORE_PROTOCOL and mode == "fleetmap" then fmStoreReply(env) end  -- store aggregate
+    end
   end
 end
 term.setBackgroundColor(colors.black); term.setTextColor(colors.white)

@@ -4,9 +4,10 @@
 -- map.lua, auto-fit to a SQUARE that stays zoomed to show every device at once: the CORE
 -- (store), the airship, the quarry/tree/wheat/crafter turtles, the pad and any probe.
 --
--- It is a pure listener - it never pings, it just shows whatever is beaconing - so it adds
--- no radio load. Give the host a RADIO ANTENNA or wireless modem (a wired-modem-only
--- computer can't hear the turtles/ship, which are wireless). Deploy as role `map`.
+-- It mainly pulls the aggregated fleet from the STORE (the store hears every device via its
+-- tall tower, so a far/short-range map device still gets the whole picture), and merges in any
+-- beacons it can hear directly as a fallback. Give the host a RADIO ANTENNA or wireless modem.
+-- Deploy as role `map`.
 --   keys: f = follow nothing/auto, q = quit   tap a marker (monitor) to centre on it
 --
 -- The renderer is reused verbatim from gpsprobe/shipnav; this file just feeds it markers.
@@ -17,7 +18,9 @@ local beacon = require("beacon")
 
 local RADIO_FREQ = 1000
 local GPS_PROTO  = "gps"
+local STORE_PROTO = "store"
 local REDRAW     = 1.0     -- seconds between redraws
+local LOCS_EVERY = 2.0     -- seconds between asking the store for its fleet aggregate
 
 comms.open({ freq = RADIO_FREQ, proto = GPS_PROTO })
 if not comms.up() then print("no radio antenna or modem found"); return end
@@ -27,6 +30,8 @@ if mon then pcall(mon.setTextScale, 0.5) end
 local dev = mon or term
 
 local tracker = beacon.tracker()
+local storeList = {}      -- aggregated fleet from the store (primary source)
+local lastLocs = -1e9
 local vp = map.viewport({ auto = true, aspect = map.SQUARE_ASPECT })   -- square, zoomed to fit all
 local proj = nil
 local me = os.getComputerID()
@@ -46,8 +51,8 @@ local function decode(ev)
     if type(raw) == "string" then local ok, d = pcall(textutils.unserialise, raw); if ok then raw = d end end
     if type(raw) == "table" and raw.__c then return raw, dist end
   elseif k == "rednet_message" then
-    local msg, p = ev[3], ev[4]
-    if p == GPS_PROTO and type(msg) == "table" and msg.__c then return msg, nil end
+    local msg = ev[3]
+    if type(msg) == "table" and msg.__c then return msg, nil end   -- dispatch on env.proto below
   end
   return nil
 end
@@ -57,19 +62,23 @@ local function render()
   dev.setBackgroundColor(colors.black); dev.setTextColor(colors.white); dev.clear()
   local now = os.clock()
 
+  -- primary: the store's aggregate; fall back to anything we heard directly. Merge by id.
+  local byId = {}
+  for _, r in ipairs(storeList) do if r.pos then byId[r.id] = r end end
+  for _, r in ipairs(tracker.list(now)) do if not byId[r.id] then byId[r.id] = r end end
   local markers = {}
-  for _, r in ipairs(tracker.list(now)) do
-    if r.id ~= me then markers[#markers + 1] = map.marker(r.pos.x, r.pos.z, r.label, r.kind) end
+  for _, r in pairs(byId) do
+    if r.id ~= me and r.pos then markers[#markers + 1] = map.marker(r.pos.x, r.pos.z, r.label, r.kind) end
   end
 
   dev.setCursorPos(1, 1); dev.setBackgroundColor(colors.blue); dev.clearLine()
   at(1, 1, " FLEET MAP", colors.white, colors.blue)
-  local tag = (#markers == 0) and "listening" or (#markers .. " online")
+  local tag = (#markers == 0) and "waiting" or (#markers .. " online")
   at(w - #tag, 1, tag, colors.white, colors.blue)
 
   if #markers == 0 then
-    at(2, 3, "no beacons heard yet", colors.gray)
-    at(2, 4, "(devices beacon every few seconds)", colors.gray)
+    at(2, 3, "no fleet yet", colors.gray)
+    at(2, 4, "(store quiet / nothing beaconing)", colors.gray)
     at(1, h, "q quit", colors.gray)
     proj = nil
     return
@@ -93,7 +102,9 @@ while true do
   local ev = { os.pullEventRaw() }
   local k = ev[1]
   if k == "terminate" then break
-  elseif k == "timer" and ev[2] == rt then render(); rt = os.startTimer(REDRAW)
+  elseif k == "timer" and ev[2] == rt then
+    if os.clock() - lastLocs >= LOCS_EVERY then comms.send("store", "locs", STORE_PROTO); lastLocs = os.clock() end
+    render(); rt = os.startTimer(REDRAW)
   elseif k == "char" then
     if ev[2] == "q" then break
     elseif ev[2] == "f" then map.setFollow(vp, false); map.fit(vp); render() end
@@ -104,7 +115,14 @@ while true do
     end
   else
     local env, dist = decode(ev)
-    if env and env.proto == GPS_PROTO and env.from ~= me then tracker.offer(env.from, env.body, dist, os.clock()) end
+    if env and env.from ~= me then
+      if env.proto == GPS_PROTO then
+        tracker.offer(env.from, env.body, dist, os.clock())            -- direct beacons (fallback)
+      elseif env.proto == STORE_PROTO and (env.to == me or env.to == "all") and type(env.body) == "string" then
+        local ok, arr = pcall(textutils.unserialise, env.body)         -- the store's aggregate
+        if ok and type(arr) == "table" then storeList = arr end
+      end
+    end
   end
 end
 dev.setBackgroundColor(colors.black); dev.setTextColor(colors.white); dev.clear(); dev.setCursorPos(1, 1)
