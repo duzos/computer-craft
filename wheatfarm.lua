@@ -24,8 +24,10 @@
 -- run: wheatfarm        (start / resume from saved state)
 --      wheatfarm reset   (wipe saved state; only when docked)
 
-local comms = require("comms")
-local gps2  = require("gps2")
+local comms  = require("comms")
+local gps2   = require("gps2")
+local beacon = require("beacon")
+local sendLoc = beacon.sender(os.getComputerLabel() or ("wheat#" .. os.getComputerID()), "wheat")
 
 local STORE_PROTOCOL = "store"
 local STORE_NAME     = "store"
@@ -146,6 +148,7 @@ local function checkin(phase)
     phase = state.phase, pct = passPct(), fuel = (fl == "unlimited") and FUEL_FULL or fl, fuelMax = FUEL_FULL,
     pos = { x = pos.x, y = pos.y, z = pos.z }, head = head, gps = gpsFlag, halted = state.halted, last = last,
   }, STORE_PROTOCOL)
+  if state.gps and state.origin then sendLoc(os.clock(), pos) end   -- presence beacon -> fleet maps
   local r = comms.receive(STORE_PROTOCOL, 0.3)
   local body = r and r.body
   rebootIfAsked(body)

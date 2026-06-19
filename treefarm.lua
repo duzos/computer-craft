@@ -18,8 +18,10 @@
 -- run: treefarm         (start / resume from saved state)
 --      treefarm reset    (wipe saved state; only when parked at the dock)
 
-local comms = require("comms")
-local gps2  = require("gps2")
+local comms  = require("comms")
+local gps2   = require("gps2")
+local beacon = require("beacon")
+local sendLoc = beacon.sender(os.getComputerLabel() or ("tree#" .. os.getComputerID()), "tree")
 
 local STORE_PROTOCOL = "store"
 local STORE_NAME     = "store"
@@ -126,6 +128,7 @@ local function checkin(phase)
     pct = 0, halted = state.halted, pos = { x = pos.x, y = pos.y, z = pos.z }, head = head, gps = gpsFlag,
     harvests = state.harvests or 0, logs = state.lastLogs or 0,
   }, STORE_PROTOCOL)
+  if state.gps and state.origin then sendLoc(os.clock(), pos) end   -- presence beacon -> fleet maps
   local r = comms.receive(STORE_PROTOCOL, 0.3)
   local body = r and r.body
   rebootIfAsked(body)

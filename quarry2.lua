@@ -19,8 +19,10 @@
 -- run: quarry2        (start / resume; asks the two chest names on first boot, saved to quarry2.cfg)
 --      quarry2 reset  (wipe saved state AND chest config, start fresh)
 
-local comms = require("comms")
-local gps2  = require("gps2")
+local comms  = require("comms")
+local gps2   = require("gps2")
+local beacon = require("beacon")
+local sendLoc = beacon.sender(os.getComputerLabel() or ("quarry#" .. os.getComputerID()), "quarry")
 
 local WIDTH       = 16
 local LENGTH      = 16
@@ -470,6 +472,7 @@ local function checkin()
     pos = { x = pos.x, y = pos.y, z = pos.z }, head = head, gps = gpsFlag,
     last = lastBlock, halted = (state.phase == "recalled"),
   }, STORE_PROTOCOL)
+  if state.gps and state.origin then sendLoc(os.clock(), pos) end   -- presence beacon -> fleet maps
   local r = comms.receive(STORE_PROTOCOL, 1.5)
   rebootIfAsked(r and r.body)
   if r and type(r.body) == "string" and r.body ~= "ok" then return r.body end

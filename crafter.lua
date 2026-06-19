@@ -18,7 +18,11 @@
 --      crafter learn   read the recipe arranged in the grid now, craft 1, upload it to the store
 --      crafter reset   wipe the saved chest config
 
-local comms = require("comms")
+local comms  = require("comms")
+local gps2   = require("gps2")
+local beacon = require("beacon")
+local sendLoc = beacon.sender(os.getComputerLabel() or ("crafter#" .. os.getComputerID()), "craft")
+local craftPos = nil   -- world position; located once and cached (the crafter is stationary)
 
 local STORE_PROTOCOL = "store"
 local STORE_NAME     = "store"
@@ -66,6 +70,7 @@ local function checkin(phase, pct, wait)
     fuel = 1, fuelMax = 1,
     craftIn = CRAFT_IN,            -- so the store learns where to deliver raws
   }, STORE_PROTOCOL)
+  if craftPos then sendLoc(os.clock(), craftPos) end   -- presence beacon -> fleet maps
   local m = comms.receive(STORE_PROTOCOL, wait or 1.5)
   local body = m and m.body
   rebootIfAsked(body)
@@ -267,6 +272,7 @@ local function main()
   announce()
   print("crafter online (freq " .. RADIO_FREQ .. ")")
   while true do
+    if not craftPos then craftPos = gps2.locate(1.5, 6) end   -- one-shot fix; stationary so cache it
     local cmd = checkin("idle")
     if type(cmd) == "table" and cmd.type == "craftplan" then
       local ok, made, err = execute(cmd.steps or {})

@@ -33,6 +33,7 @@ map.KIND = {
   target = { colour = colors.red,       char = "X" },
   quarry = { colour = colors.yellow,    char = "Q" },
   tree   = { colour = colors.green,     char = "t" },
+  wheat  = { colour = colors.green,     char = "w" },
   craft  = { colour = colors.orange,    char = "C" },
   pad    = { colour = colors.magenta,   char = "P" },
   probe  = { colour = colors.lightBlue, char = "p" },
