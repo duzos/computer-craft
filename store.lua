@@ -1631,7 +1631,7 @@ local function drawFleet(mon)
   local tag = #markers .. " online"
   txt(w - #tag, 1, tag, colors.white, colors.blue)
   if #markers == 0 then txt(2, 3, "no devices beaconing yet", colors.gray); return end
-  map.draw(mon, markers, fleetVp, { box = { x1 = 1, y1 = 2, x2 = w, y2 = h - 1 }, border = true, scalebar = true })
+  map.draw(mon, markers, fleetVp, { box = { x1 = 1, y1 = 2, x2 = w, y2 = h - 1 }, border = true, scalebar = true, chunkGrid = true })
   local seen, parts = {}, {}                                 -- glyph legend (labels are off on the map)
   for _, m in ipairs(markers) do
     if m.kind and not seen[m.kind] then seen[m.kind] = true; parts[#parts + 1] = (m.char or "?") .. m.kind end

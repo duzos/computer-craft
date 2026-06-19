@@ -417,7 +417,7 @@ local function fleetRender()
     return
   end
   fmProj = map.draw(term, markers, fmVp, {
-    box = { x1 = 1, y1 = 2, x2 = W, y2 = H - 1 }, border = true, scalebar = true,
+    box = { x1 = 1, y1 = 2, x2 = W, y2 = H - 1 }, border = true, scalebar = true, chunkGrid = true,
   })
   at(1, H, "x=menu tap=ctr f=fit q", colors.gray)
 end

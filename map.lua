@@ -142,6 +142,8 @@ end
 --   opts.labels   : write each marker's label after its glyph when there is room
 --   opts.scalebar : draw a "+--+ Nm" ruler on the bottom edge so the zoom is legible
 --   opts.scaleColour : scale bar colour (default white)
+--   opts.chunkGrid : faint grid on chunk boundaries (multiples of 16, coarsened when zoomed out)
+--   opts.gridColour : chunk grid colour (default gray)
 function map.draw(dev, markers, vp, opts)
   opts = opts or {}
   markers = markers or {}
@@ -192,6 +194,33 @@ function map.draw(dev, markers, vp, opts)
     dev.setCursorPos(c, r); dev.setTextColor(fg or colors.white); dev.write(s)
   end
 
+  -- chunk grid: faint lines on chunk boundaries (world coords that are a multiple of 16),
+  -- coarsened to a higher multiple of 16 when zoomed out so the lines stay legible. Drawn
+  -- first, under everything. Records the interval so the scale bar can match one grid cell.
+  if opts.chunkGrid and scale > 0 then
+    local interval = 16
+    while interval * scale < 5 and interval < 100000 do interval = interval * 2 end
+    local gc = opts.gridColour or colors.gray
+    local wxL, wzT = map.screenToWorld(proj, px1, py1)
+    local wxR, wzB = map.screenToWorld(proj, px2, py2)
+    local gridRows = {}
+    dev.setBackgroundColor(colors.black); dev.setTextColor(gc)
+    for j = math.ceil(wzT / interval), math.floor(wzB / interval) do
+      local _, row = map.worldToScreen(proj, cx, j * interval)
+      if row >= py1 and row <= py2 then
+        gridRows[row] = true
+        dev.setCursorPos(px1, row); dev.write(string.rep("-", px2 - px1 + 1))
+      end
+    end
+    for k = math.ceil(wxL / interval), math.floor(wxR / interval) do
+      local col = map.worldToScreen(proj, k * interval, cz)
+      if col >= px1 and col <= px2 then
+        for r = py1, py2 do plot(col, r, gridRows[r] and "+" or "|", gc) end
+      end
+    end
+    proj.gridInterval = interval
+  end
+
   -- range rings (gpsprobe feeds tower distances; they cross at the fix)
   if opts.rings then
     for _, ring in ipairs(opts.rings) do
@@ -232,12 +261,17 @@ function map.draw(dev, markers, vp, opts)
   -- Snap the target width to a 1/2/5 * 10^k count; drawn on the bottom edge (over the
   -- border row if there is one) as "+----+ Nm" using the X scale (cols per block).
   if opts.scalebar and scale > 0 then
-    local targetCells = math.max(6, math.min(20, math.floor((px2 - px1) / 3)))
-    local raw = targetCells / scale
-    if raw > 0 then
+    local n
+    if proj.gridInterval then
+      n = proj.gridInterval                       -- match the ruler to one chunk-grid cell
+    else
+      local targetCells = math.max(6, math.min(20, math.floor((px2 - px1) / 3)))
+      local raw = targetCells / scale
       local pow = 10 ^ math.floor(math.log(raw) / math.log(10))
       local base = raw / pow
-      local n = (base < 1.5 and 1 or (base < 3.5 and 2 or (base < 7.5 and 5 or 10))) * pow
+      n = (base < 1.5 and 1 or (base < 3.5 and 2 or (base < 7.5 and 5 or 10))) * pow
+    end
+    if n and n > 0 then
       local L = math.max(1, math.floor(n * scale + 0.5))
       local by = opts.border and y2 or py2
       local bx = opts.border and (x1 + 1) or px1

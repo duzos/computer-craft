@@ -76,7 +76,7 @@ local function render()
   end
 
   proj = map.draw(dev, markers, vp, {
-    box = { x1 = 1, y1 = 2, x2 = w, y2 = h - 1 }, border = true, scalebar = true,
+    box = { x1 = 1, y1 = 2, x2 = w, y2 = h - 1 }, border = true, scalebar = true, chunkGrid = true,
   })
 
   -- legend of the kinds currently visible
