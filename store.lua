@@ -3,7 +3,9 @@
 -- Create fan processing barrels (smelt/cook/wash + output), a chat box, and an advanced monitor.
 -- commands work on the terminal and in chat (prefixed). e.g.  get raw_iron 64
 
-local comms = require("comms")
+local comms  = require("comms")
+local map    = require("map")
+local beacon = require("beacon")
 local args = { ... }
 
 ----------------------------------------------------------------- config
@@ -124,6 +126,9 @@ local MONS_FILE = "store.mons"
 local touchRegions = {}      -- monitor name -> { kind, rows/items, buttons = {{x1,x2,y,act,val}}, draw }
 local monSel = {}            -- monitor name -> selected turtle id (turtles page)
 local monStore = {}          -- monitor name -> { sel, scroll, amt, dest, sortMode, list, rows, maxScroll }
+local fleetSeen = beacon.tracker()                          -- loc beacons heard, for the fleet map page
+local fleetVp = map.viewport({ auto = true, aspect = map.SQUARE_ASPECT })  -- square, zoomed to fit all
+local corePos = nil          -- this store's own location (CORE), read once from gpshost.state
 local STORE_AMOUNTS = { 1, 8, 16, 32, 64 }
 local STORE_SORTS = {                  -- index 1 is the default; a-z first
   { key = "a-z", cmp = function(a, b) return (a.id:match("[^:]+$") or a.id) < (b.id:match("[^:]+$") or b.id) end },
@@ -1111,12 +1116,13 @@ local function handle(line, reply, origin)
         monAssign[target] = nil; saveMons(); reply("cleared assignment for " .. target)
       elseif target:lower() == "auto" then
         monAssign = {}; saveMons(); reply("all monitors back to auto (size-based)")
-      elseif pg == "overview" or pg == "stats" or pg == "turtles" or pg == "quarry" or pg == "store" or pg == "blank" then
+      elseif pg == "overview" or pg == "stats" or pg == "turtles" or pg == "quarry" or pg == "store" or pg == "fleet" or pg == "map" or pg == "blank" then
         if pg == "quarry" then pg = "turtles" end
         if pg == "stats" then pg = "overview" end
+        if pg == "map" then pg = "fleet" end
         monAssign[target] = pg; saveMons(); reply(target .. " -> " .. pg)
       else
-        reply("usage: mon <name> <overview|turtles|store|blank|auto>  |  mon auto  (reset all)")
+        reply("usage: mon <name> <overview|turtles|store|fleet|blank|auto>  |  mon auto  (reset all)")
       end
     else
       local parts = {}
@@ -1586,12 +1592,60 @@ local function drawStore(mon)
   end
 end
 
+----------------------------------------------------------------- fleet map page
+-- the store is itself the CORE, but comms drops our own beacon (self-echo guard), so we plot
+-- CORE from the co-hosted gpshost's surveyed position on disk rather than from a beacon.
+local function coreLoad()
+  if corePos ~= nil then return corePos or nil end
+  corePos = false
+  if fs.exists("gpshost.state") then
+    local f = fs.open("gpshost.state", "r"); local t = textutils.unserialize(f.readAll()); f.close()
+    if type(t) == "table" and type(t.x) == "number" and type(t.z) == "number" then corePos = t end
+  end
+  return corePos or nil
+end
+
+-- top-down fleet map on a monitor: CORE + every loc beacon (ship/turtles/pad/probe), auto-fit
+-- to a square zoomed to show all. Non-interactive (auto-fit), so it clears its touch region.
+local function drawFleet(mon)
+  if not mon then return end
+  mon.setTextScale(0.5)
+  mon.setBackgroundColor(colors.black); mon.setTextColor(colors.white); mon.clear()
+  local w, h = mon.getSize()
+  touchRegions[peripheral.getName(mon)] = nil
+  local function txt(x, y, s, fg, bg)
+    if y < 1 or y > h then return end
+    s = #s > w - x + 1 and s:sub(1, w - x + 1) or s
+    mon.setCursorPos(x, y); mon.setTextColor(fg or colors.white)
+    mon.setBackgroundColor(bg or colors.black); mon.write(s); mon.setBackgroundColor(colors.black)
+  end
+  local now = os.clock()
+  local markers = {}
+  local cp = coreLoad()
+  if cp then markers[#markers + 1] = map.marker(cp.x, cp.z, "CORE", "core") end
+  for _, r in ipairs(fleetSeen.list(now)) do
+    if r.id ~= os.getComputerID() then markers[#markers + 1] = map.marker(r.pos.x, r.pos.z, r.label, r.kind) end
+  end
+  txt(1, 1, string.rep(" ", w), colors.white, colors.blue)
+  txt(2, 1, "FLEET MAP", colors.white, colors.blue)
+  local tag = #markers .. " online"
+  txt(w - #tag, 1, tag, colors.white, colors.blue)
+  if #markers == 0 then txt(2, 3, "no devices beaconing yet", colors.gray); return end
+  map.draw(mon, markers, fleetVp, { box = { x1 = 1, y1 = 2, x2 = w, y2 = h - 1 }, border = true, scalebar = true })
+  local seen, parts = {}, {}                                 -- glyph legend (labels are off on the map)
+  for _, m in ipairs(markers) do
+    if m.kind and not seen[m.kind] then seen[m.kind] = true; parts[#parts + 1] = (m.char or "?") .. m.kind end
+  end
+  txt(1, h, table.concat(parts, " "), colors.gray)
+end
+
 ----------------------------------------------------------------- monitor manager
-local PAGES = { drawOverview, drawQuarry, drawStore }   -- biggest monitor first
+local PAGES = { drawOverview, drawQuarry, drawStore, drawFleet }   -- biggest monitor first
 local PAGEMAP = {
   overview = drawOverview, stats = drawOverview,
   turtles = drawQuarry, quarry = drawQuarry,
   store = drawStore,
+  fleet = drawFleet, map = drawFleet,
 }
 local CYCLE = 6
 local cyclePage, lastCycle = 1, 0
@@ -1609,7 +1663,7 @@ local function paintMon(mon, fn)
     if lp and lp.fn == "blank" then return end
     blankMon(mon); lastPaint[name] = { fn = "blank", rev = uiRev }; return
   end
-  local timed = (fn == drawOverview or fn == drawQuarry)
+  local timed = (fn == drawOverview or fn == drawQuarry or fn == drawFleet)
   if not timed and lp and lp.fn == fn and lp.rev == uiRev then return end
   fn(mon)
   lastPaint[name] = { fn = fn, rev = uiRev }
@@ -1745,6 +1799,30 @@ local function openLinks()
   return #t > 0 and table.concat(t, "+") or nil
 end
 
+-- collect fleet presence beacons (gps proto) for the fleet map page. Decodes the raw
+-- transport events itself rather than comms.receive("gps"): the co-hosted gpshost also reads
+-- the gps proto, and decoding raw sidesteps any shared comms dedupe that could let one
+-- consume a beacon before the other. Under parallel every coroutine sees every event.
+local function fleetLoop()
+  while true do
+    local ev = { os.pullEvent() }
+    local k = ev[1]
+    local env, dist
+    if k == "radio_message" then
+      local raw, d = ev[3], ev[4]
+      if type(raw) == "string" then local ok, dec = pcall(textutils.unserialise, raw); if ok then raw = dec end end
+      if type(raw) == "table" and raw.__c then env, dist = raw, d end
+    elseif k == "rednet_message" then
+      local msg, p = ev[3], ev[4]
+      if p == "gps" and type(msg) == "table" and msg.__c then env = msg end
+    end
+    if env and env.proto == "gps" and env.from ~= os.getComputerID()
+       and type(env.body) == "table" and env.body.type == "loc" then
+      fleetSeen.offer(env.from, env.body, dist, os.clock())
+    end
+  end
+end
+
 local function commsLoop()
   while true do
     local m = comms.receive(STORE_PROTOCOL)
@@ -1869,7 +1947,7 @@ local function main()
   print(("store ready: %d storage, %d in, %d out, %d fuel, %d proc barrels, chat=%s, monitors=%d, link=%s, manager=%s")
     :format(#storage, #inputs, #outputs, #fuels, nproc,
             chatBox and "y" or "n", #monitors, link or "none", manager and "y" or "n"))
-  local loops = { terminalLoop, chatLoop, workerLoop, monitorTouchLoop }
+  local loops = { terminalLoop, chatLoop, workerLoop, monitorTouchLoop, fleetLoop }
   if link then loops[#loops + 1] = commsLoop end
   parallel.waitForAny(table.unpack(loops))
 end
