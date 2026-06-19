@@ -15,7 +15,8 @@
 --     reply carries a radio distance and nothing races the dedupe with a distance-
 --     less rednet copy.
 
-local comms = require("comms")
+local comms  = require("comms")
+local beacon = require("beacon")
 
 local GPS_PROTO  = "gps"
 local RADIO_FREQ = 1000
@@ -60,8 +61,11 @@ if not comms.up() then print("no radio/modem found; gps host cannot run"); retur
 print(("gps host #%d at (%d,%d,%d) on '%s' -- Ctrl+T to quit")
   :format(os.getComputerID(), POS.x, POS.y, POS.z, GPS_PROTO))
 
+-- the store's co-hosted tower also beacons itself as CORE so the fleet maps mark the hub
+-- (standalone towers don't; they're plotted from their gpsr replies, not as fleet).
+local sendCore = cohost and beacon.sender("CORE", "core", beacon.INTERVAL) or nil
 while true do
-  local m = comms.receive(GPS_PROTO)
+  local m = comms.receive(GPS_PROTO, cohost and beacon.INTERVAL or nil)
   if m and type(m.body) == "table" then
     if m.body.type == "gpsq" then
       comms.send(m.from, { type = "gpsr", pos = POS }, GPS_PROTO)
@@ -69,4 +73,5 @@ while true do
       os.reboot()   -- fleet reboot broadcast: standalone towers cycle to pick up new code
     end
   end
+  if sendCore then sendCore(os.clock(), POS) end
 end

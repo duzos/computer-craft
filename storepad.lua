@@ -1,7 +1,10 @@
 -- storepad.lua  --  store + overview console for a pocket computer with a mini radio antenna
 -- boot menu picks a mode; x returns to it. talks to the store over comms.lua.
 
-local comms = require("comms")
+local comms  = require("comms")
+local map    = require("map")
+local gps2   = require("gps2")
+local beacon = require("beacon")
 local STORE_PROTOCOL = "store"
 local RADIO_FREQ     = 1000       -- must match the store's RADIO_FREQ
 
@@ -9,7 +12,7 @@ local link = comms.open({ freq = RADIO_FREQ, proto = STORE_PROTOCOL })
 if not comms.up() then print("No radio antenna or wireless modem found."); return end
 
 local W, H = term.getSize()
-local mode = "menu"               -- menu | store | overview
+local mode = "menu"               -- menu | store | overview | fleetmap
 local status = ""
 
 local function req(line)
@@ -344,29 +347,108 @@ local function overviewChar(c)
   elseif c == "f" then status = ""; fetchFleet() end
 end
 
+----------------------------------------------------------------- fleet map
+-- third mode: a top-down map of the whole fleet from the presence beacons (beacon.lua),
+-- auto-fit to a SQUARE zoomed to show every device at once. Plots the CORE, the ship, the
+-- turtles, any probe, plus YOU (the pad, self-located off the towers). Pure overlay over
+-- the shared map.lua; the pad pings the towers for its own fix and rides the gps channel.
+local fmVp = map.viewport({ auto = true, aspect = map.SQUARE_ASPECT })
+local fmTracker = beacon.tracker()
+local fmHosts = {}                 -- towerId -> { pos, ds, last } for our own trilateration
+local fmSelf = nil                 -- our position (the PAD marker)
+local fmProj, fmTimer = nil, nil
+local sendPad = beacon.sender(os.getComputerLabel() or ("pad#" .. os.getComputerID()), "pad")
+local FM_PING, FM_MAXS = 0.6, 8
+
+local function fmPing() comms.send("all", { type = "gpsq" }, "gps") end
+
+local function fmDecode(ev)        -- raw transport event -> comms envelope (+ radio dist)
+  local k = ev[1]
+  if k == "radio_message" then
+    local raw, dist = ev[3], ev[4]
+    if type(raw) == "string" then local ok, d = pcall(textutils.unserialise, raw); if ok then raw = d end end
+    if type(raw) == "table" and raw.__c then return raw, dist end
+  elseif k == "rednet_message" then
+    local msg, p = ev[3], ev[4]
+    if p == "gps" and type(msg) == "table" and msg.__c then return msg, nil end
+  end
+  return nil
+end
+
+local function fmIngest(env, dist)
+  if not (env and env.proto == "gps" and env.from ~= os.getComputerID() and type(env.body) == "table") then return end
+  local b = env.body
+  if b.type == "gpsr" and dist and type(b.pos) == "table" then
+    local h = fmHosts[env.from]; if not h then h = { ds = {} }; fmHosts[env.from] = h end
+    h.pos = b.pos; h.ds[#h.ds + 1] = dist
+    while #h.ds > FM_MAXS do table.remove(h.ds, 1) end
+    h.last = os.clock()
+  elseif b.type == "loc" then
+    fmTracker.offer(env.from, b, dist, os.clock())
+  end
+end
+
+local function fmTick()            -- ping towers, refresh our own fix, beacon ourselves
+  fmPing()
+  local now, pts = os.clock(), {}
+  for _, h in pairs(fmHosts) do
+    if h.pos and #h.ds > 0 and now - (h.last or 0) <= 5 then
+      local s = 0; for _, d in ipairs(h.ds) do s = s + d end
+      pts[#pts + 1] = { x = h.pos.x, y = h.pos.y, z = h.pos.z, d = s / #h.ds }
+    end
+  end
+  if #pts >= 4 then fmSelf = gps2.trilaterate(pts) or fmSelf end
+  if fmSelf then sendPad(now, fmSelf) end
+end
+
+local function fleetRender()
+  term.setBackgroundColor(colors.black); term.clear()
+  local now = os.clock()
+  local markers = {}
+  for _, r in ipairs(fmTracker.list(now)) do
+    if r.id ~= os.getComputerID() then markers[#markers + 1] = map.marker(r.pos.x, r.pos.z, r.label, r.kind) end
+  end
+  if fmSelf then markers[#markers + 1] = map.marker(fmSelf.x, fmSelf.z, "PAD", "pad") end
+  titleBar("FLEET", #markers .. " seen", colors.lightBlue)
+  if #markers == 0 then
+    at(2, 3, fmSelf and "no devices heard yet" or "locating... (need 4 towers)", colors.gray)
+    at(1, H, "x menu   q quit", colors.gray)
+    fmProj = nil
+    return
+  end
+  fmProj = map.draw(term, markers, fmVp, {
+    box = { x1 = 1, y1 = 2, x2 = W, y2 = H - 1 }, border = true, labels = true,
+  })
+  at(1, H, "x=menu tap=ctr f=fit q", colors.gray)
+end
+
 ----------------------------------------------------------------- menu
 local menuRegions = {}
+local MENU = { { "Store", "store" }, { "Overview", "overview" }, { "Fleet Map", "fleetmap" } }
 local function menuRender()
   term.setBackgroundColor(colors.black); term.clear()
   titleBar("STOREPAD")
   menuRegions = {}
-  local opts = { { "Store",  "store" }, { "Overview", "overview" } }
+  local opts = MENU
   for i, o in ipairs(opts) do
     local y = 3 + (i - 1) * 3
     fillRow(y, colors.gray); at(2, y, "[" .. i .. "] " .. o[1], colors.white, colors.gray)
     menuRegions[#menuRegions + 1] = { y = y, m = o[2] }
   end
-  at(1, H, "1/2 or tap   q quit", colors.gray)
+  at(1, H, "1-3 or tap   q quit", colors.gray)
 end
 local function enter(m)
   mode = m; status = ""; procPick = false
-  if m == "store" then fetchStore() elseif m == "overview" then fetchFleet() end
+  if m == "store" then fetchStore()
+  elseif m == "overview" then fetchFleet()
+  elseif m == "fleetmap" then fmPing(); fmTimer = os.startTimer(FM_PING) end
 end
 
 ----------------------------------------------------------------- dispatch
 local function render()
   if mode == "menu" then menuRender()
   elseif mode == "store" then storeRender()
+  elseif mode == "fleetmap" then fleetRender()
   else overviewRender() end
 end
 
@@ -379,6 +461,10 @@ while true do
     if mode == "menu" then
       for _, r in ipairs(menuRegions) do if ev[4] == r.y then enter(r.m) end end
     elseif mode == "store" then storeClick(ev[3], ev[4])
+    elseif mode == "fleetmap" then
+      if fmProj and map.inBox(fmProj, ev[3], ev[4]) then
+        local wx, wz = map.screenToWorld(fmProj, ev[3], ev[4]); map.center(fmVp, wx, wz)
+      end
     else overviewClick(ev[3], ev[4]) end
     render()
   elseif e == "mouse_scroll" then
@@ -393,10 +479,15 @@ while true do
     local c = ev[2]
     if c == "q" then break
     elseif c == "x" and mode ~= "menu" then mode = "menu"; status = ""
-    elseif mode == "menu" and (c == "1" or c == "2") then enter(c == "1" and "store" or "overview")
+    elseif mode == "menu" and tonumber(c) and MENU[tonumber(c)] then enter(MENU[tonumber(c)][2])
     elseif mode == "store" then storeChar(c)
-    elseif mode == "overview" then overviewChar(c) end
+    elseif mode == "overview" then overviewChar(c)
+    elseif mode == "fleetmap" and c == "f" then map.fit(fmVp) end
     render()
+  elseif e == "timer" then
+    if ev[2] == fmTimer and mode == "fleetmap" then fmTick(); render(); fmTimer = os.startTimer(FM_PING) end
+  elseif e == "radio_message" or e == "rednet_message" then
+    fmIngest(fmDecode(ev))   -- collect tower fixes + presence beacons for the fleet map
   end
 end
 term.setBackgroundColor(colors.black); term.setTextColor(colors.white)

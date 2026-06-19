@@ -24,6 +24,12 @@ local map = {}
 local MIN_SCALE, MAX_SCALE = 0.01, 16
 local function clampScale(s) return math.max(MIN_SCALE, math.min(MAX_SCALE, s)) end
 
+-- aspect = (rows per block) / (cols per block). A CC font cell is ~6 wide x 9 tall, so
+-- to make a square world region look square on screen you need fewer rows than cols per
+-- block: aspect 6/9. Default viewport aspect is 1.0 (the legacy stretched look the
+-- gpsprobe/shipnav overlays use); the fleet maps pass map.SQUARE_ASPECT for a true square.
+map.SQUARE_ASPECT = 6 / 9
+
 -- default glyph + colour per marker kind; map.marker() applies these, callers override
 map.KIND = {
   self   = { colour = colors.lime,      char = "@" },
@@ -31,6 +37,7 @@ map.KIND = {
   ship   = { colour = colors.lime,      char = "^" },
   tower  = { colour = colors.cyan,      char = "T" },
   target = { colour = colors.red,       char = "X" },
+  core   = { colour = colors.cyan,      char = "#" },
   quarry = { colour = colors.yellow,    char = "Q" },
   tree   = { colour = colors.green,     char = "t" },
   wheat  = { colour = colors.green,     char = "w" },
@@ -55,7 +62,8 @@ end
 
 function map.viewport(o)
   o = o or {}
-  return { cx = o.cx, cz = o.cz, scale = o.scale, auto = o.auto ~= false, follow = o.follow or false }
+  return { cx = o.cx, cz = o.cz, scale = o.scale, auto = o.auto ~= false,
+           follow = o.follow or false, aspect = o.aspect or 1 }
 end
 
 -- zoom in (factor>1) / out (factor<1) about the current centre; leaves auto-fit
@@ -77,19 +85,21 @@ function map.center(vp, x, z) vp.auto = false; vp.cx, vp.cz = x, z; return vp en
 function map.fit(vp) vp.auto = true; return vp end
 function map.setFollow(vp, on) vp.follow = on and true or false; if on then vp.auto = false end; return vp end
 
--- proj is the table returned by draw(): { x1,y1,x2,y2 (plot box), cx, cz, scale }
+-- proj is the table returned by draw(): { x1,y1,x2,y2 (plot box), cx, cz, scale, aspect }
 function map.worldToScreen(proj, x, z)
   local midC = (proj.x1 + proj.x2) / 2
   local midR = (proj.y1 + proj.y2) / 2
+  local sz = proj.scale * (proj.aspect or 1)
   return math.floor(midC + (x - proj.cx) * proj.scale + 0.5),
-         math.floor(midR + (z - proj.cz) * proj.scale + 0.5)
+         math.floor(midR + (z - proj.cz) * sz + 0.5)
 end
 
 function map.screenToWorld(proj, col, row)
   local midC = (proj.x1 + proj.x2) / 2
   local midR = (proj.y1 + proj.y2) / 2
+  local sz = proj.scale * (proj.aspect or 1)
   return proj.cx + (col - midC) / proj.scale,
-         proj.cz + (row - midR) / proj.scale
+         proj.cz + (row - midR) / sz
 end
 
 -- true when a screen cell falls inside the plot box (for touch hit-testing)
@@ -97,7 +107,10 @@ function map.inBox(proj, col, row)
   return col >= proj.x1 and col <= proj.x2 and row >= proj.y1 and row <= proj.y2
 end
 
-local function fitView(markers, dots, px1, py1, px2, py2, minSpan)
+-- auto-fit: centre + the largest scale that still fits every element in the box. With
+-- aspect, the Z axis is scaled by `aspect` rows/block, so the fit honours both axes and
+-- the result stays square. Returns cx, cz, scale (scale = cols/block; rows/block = *aspect).
+local function fitView(markers, dots, px1, py1, px2, py2, minSpan, aspect)
   local minX, maxX, minZ, maxZ
   local function inc(x, z)
     if not x then return end
@@ -115,7 +128,7 @@ local function fitView(markers, dots, px1, py1, px2, py2, minSpan)
   local cx, cz = (minX + maxX) / 2, (minZ + maxZ) / 2
   local spanX = math.max(maxX - minX, minSpan)
   local spanZ = math.max(maxZ - minZ, minSpan)
-  local scale = math.min((px2 - px1) / spanX, (py2 - py1) / spanZ)
+  local scale = math.min((px2 - px1) / spanX, (py2 - py1) / (spanZ * (aspect or 1)))
   if scale <= 0 then scale = 0.01 end
   return cx, cz, scale
 end
@@ -155,9 +168,11 @@ function map.draw(dev, markers, vp, opts)
   end
 
   local minSpan = opts.minSpan or 8
+  local aspect = vp.aspect or 1
+  local fitDots = (opts.fitDots ~= false) and opts.dots or nil   -- towers-as-dots can opt out of the fit
   local cx, cz, scale = vp.cx, vp.cz, vp.scale
   if vp.auto or not (cx and cz and scale) then
-    cx, cz, scale = fitView(markers, opts.dots, px1, py1, px2, py2, minSpan)
+    cx, cz, scale = fitView(markers, fitDots, px1, py1, px2, py2, minSpan, aspect)
     vp.cx, vp.cz, vp.scale = cx, cz, scale   -- seed so a later zoom/pan starts here
   end
   if vp.follow then
@@ -166,7 +181,7 @@ function map.draw(dev, markers, vp, opts)
     end
   end
   scale = clampScale(scale)
-  local proj = { x1 = px1, y1 = py1, x2 = px2, y2 = py2, cx = cx, cz = cz, scale = scale }
+  local proj = { x1 = px1, y1 = py1, x2 = px2, y2 = py2, cx = cx, cz = cz, scale = scale, aspect = aspect }
 
   dev.setBackgroundColor(colors.black)
 
@@ -205,8 +220,8 @@ function map.draw(dev, markers, vp, opts)
       local c, r = map.worldToScreen(proj, m.x, m.z)
       local glyph = m.char or (m.label and m.label:sub(1, 1)) or "*"
       plot(c, r, glyph, m.colour or colors.white)
-      if opts.labels and m.label and c + #glyph <= px2 then
-        plot(c + #glyph, r, m.label, m.colour or colors.white)
+      if opts.labels and m.label and c + #glyph + 1 <= px2 then
+        plot(c + #glyph + 1, r, m.label, m.colour or colors.white)   -- gap cell keeps glyph + label apart
       end
     end
   end

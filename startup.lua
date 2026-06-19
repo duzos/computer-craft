@@ -14,6 +14,7 @@
 --   boiler  boilerkeeper.lua
 --   pad     storepad.lua
 --   ship    shipnav.lua                       (airship XYZ autopilot; prompts relays -> shipnav.cfg)
+--   map     fleetmap.lua                      (fleet map on an advanced monitor)
 --
 --   startup reset   re-ask the role (wipes device.cfg)
 --
@@ -35,6 +36,7 @@ local ROLES = {
   boiler = { run = "boilerkeeper.lua" },
   pad    = { run = "storepad.lua" },
   ship   = { run = "shipnav.lua" },
+  map    = { run = "fleetmap.lua" },
 }
 
 local function empty(path)
