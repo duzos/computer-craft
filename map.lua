@@ -140,6 +140,8 @@ end
 --   opts.borderColour, opts.rings (list {x,z,r,colour}), opts.dots (list {x,z,colour,char})
 --   opts.minSpan  : smallest world span auto-fit will zoom to (default 8)
 --   opts.labels   : write each marker's label after its glyph when there is room
+--   opts.scalebar : draw a "+--+ Nm" ruler on the bottom edge so the zoom is legible
+--   opts.scaleColour : scale bar colour (default white)
 function map.draw(dev, markers, vp, opts)
   opts = opts or {}
   markers = markers or {}
@@ -223,6 +225,29 @@ function map.draw(dev, markers, vp, opts)
       if opts.labels and m.label and c + #glyph + 1 <= px2 then
         plot(c + #glyph + 1, r, m.label, m.colour or colors.white)   -- gap cell keeps glyph + label apart
       end
+    end
+  end
+
+  -- scale bar: a ruler whose length is a round number of blocks, so the zoom is legible.
+  -- Snap the target width to a 1/2/5 * 10^k count; drawn on the bottom edge (over the
+  -- border row if there is one) as "+----+ Nm" using the X scale (cols per block).
+  if opts.scalebar and scale > 0 then
+    local targetCells = math.max(6, math.min(20, math.floor((px2 - px1) / 3)))
+    local raw = targetCells / scale
+    if raw > 0 then
+      local pow = 10 ^ math.floor(math.log(raw) / math.log(10))
+      local base = raw / pow
+      local n = (base < 1.5 and 1 or (base < 3.5 and 2 or (base < 7.5 and 5 or 10))) * pow
+      local L = math.max(1, math.floor(n * scale + 0.5))
+      local by = opts.border and y2 or py2
+      local bx = opts.border and (x1 + 1) or px1
+      local sc = opts.scaleColour or colors.white
+      dev.setBackgroundColor(colors.black); dev.setTextColor(sc)
+      dev.setCursorPos(bx, by); dev.write("+")
+      for i = 1, L - 1 do dev.setCursorPos(bx + i, by); dev.write("-") end
+      dev.setCursorPos(bx + L, by); dev.write("+")
+      local lbl = " " .. (n >= 1 and tostring(math.floor(n + 0.5)) or string.format("%.1f", n)) .. "m"
+      dev.setCursorPos(bx + L + 1, by); dev.write(lbl)
     end
   end
 
