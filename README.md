@@ -11,30 +11,30 @@
 
 ## What is it?
 
-A collection of [ComputerCraft / CC: Tweaked](https://tweaked.cc/) Lua programs written for the **Summerhelm** Minecraft server — automation for turtles, GPS, communications, and general utilities. They're drop-in scripts rather than a single packaged program.
+A collection of [ComputerCraft / CC: Tweaked](https://tweaked.cc/) Lua programs written for the **Summerhelm** Minecraft server - automation for turtles, GPS, communications, and general utilities. They're drop-in scripts rather than a single packaged program.
 
 ## What's in here
 
 **Turtle automation**
-- `quarry.lua`, `quarry2.lua` — dig out a quarry
-- `treefarm.lua` — automated tree farming
-- `wheatfarm.lua` — automated wheat farming
-- `crafter.lua` — turtle crafting
+- `quarry.lua`, `quarry2.lua` - dig out a quarry
+- `treefarm.lua` - automated tree farming
+- `wheatfarm.lua` - automated wheat farming
+- `crafter.lua` - turtle crafting
 
 **GPS & positioning**
-- `gpshost.lua`, `gps2.lua`, `gpsprobe.lua`, `gpsrange.lua`, `range.lua` — set up and query a GPS network
+- `gpshost.lua`, `gps2.lua`, `gpsprobe.lua`, `gpsrange.lua`, `range.lua` - set up and query a GPS network
 
 **Communications & radio**
-- `comms.lua`, `radioping.lua`, `radioinfo.lua`, `radiotest.lua` — messaging between computers
+- `comms.lua`, `radioping.lua`, `radioinfo.lua`, `radiotest.lua` - messaging between computers
 
 **Navigation & mapping**
-- `shipnav.lua`, `fleetmap.lua`, `map.lua` — movement and map tooling
+- `shipnav.lua`, `fleetmap.lua`, `map.lua` - movement and map tooling
 
 **Utilities**
-- `startup.lua` — runs on boot
-- `update.lua` — pull the latest scripts
-- `store.lua`, `storepad.lua` — storage handling
-- `beacon.lua`, `boilerkeeper.lua`, `redstone.lua` — assorted helpers
+- `startup.lua` - runs on boot
+- `update.lua` - pull the latest scripts
+- `store.lua`, `storepad.lua` - storage handling
+- `beacon.lua`, `boilerkeeper.lua`, `redstone.lua` - assorted helpers
 
 ## Usage
 
@@ -44,10 +44,10 @@ Drop a script onto a ComputerCraft computer or turtle (paste it in, or `wget` it
 quarry
 ```
 
-Some programs expect a particular setup — fuelled turtles, a running GPS host, or paired computers on the same channel — so read the top of each file before running it.
+Some programs expect a particular setup - fuelled turtles, a running GPS host, or paired computers on the same channel - so read the top of each file before running it.
 
 ## Notes
 
-These are personal/server scripts for Summerhelm, shared as-is. There's no build step — it's all plain Lua.
+These are personal/server scripts for Summerhelm, shared as-is. There's no build step - it's all plain Lua.
 
 By [Duzo](https://duzo.is-a.dev/).
